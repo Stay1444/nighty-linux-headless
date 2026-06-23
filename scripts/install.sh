@@ -8,7 +8,7 @@
 #  What it sets up (only if missing):
 #    • base tools (curl, tar, xz, gnupg)         • Python 3
 #    • Xvfb (virtual display)                     • uv (fetches Python 3.8)
-#    • x86-64:  Wine (native, from your distro)
+#    • x86-64:  Wine (native, from your distro — or a static build if it's <10)
 #    • non-x86: Box64  +  a static x86-64 Wine build (runs under Box64)
 #
 #  You only need to bring your own licensed Nighty.exe (it is never shipped).
@@ -112,7 +112,8 @@ info "Checking base tools…"
 if ! need curl && ! need wget; then pm_install curl; fi
 need curl || need wget || die "Need curl or wget."
 ensure tar  tar  "tar"
-[ "$IS_X86" = 1 ] || ensure xz xz "xz (extractor)"   # only needed to unpack the Wine tarball
+# xz is only needed to unpack the static Wine tarball; ensure_wine_static_x86
+# installs it on demand (it can now be needed on x86-64 too, as a fallback).
 
 # ── 2) Python 3 + Xvfb ───────────────────────────────────────────────────────
 ensure python3 python3 "Python 3"
@@ -151,13 +152,35 @@ ensure_runtime_home() {
 }
 ensure_runtime_home
 
-ensure_wine_native() {
-  if need wine64; then ok "Wine present"; WINE_BIN_RESOLVED="$(command -v wine64)"; return; fi
-  if need wine;   then ok "Wine present"; WINE_BIN_RESOLVED="$(command -v wine)";   return; fi
-  add "Wine missing"
-  pm_install wine
-  WINE_BIN_RESOLVED="$(command -v wine64 || command -v wine || true)"
-  [ -n "$WINE_BIN_RESOLVED" ] && ok "Wine installed ($WINE_BIN_RESOLVED)" || die "Wine still missing after install."
+# Wine's MAJOR version number (e.g. "9" from "wine-9.0"), or 0 if it can't be read.
+wine_major() { # <wine-binary>
+  local out; out="$("$1" --version 2>/dev/null | head -n1)"
+  out="$(printf '%s' "$out" | grep -oE '[0-9]+' | head -n1)"
+  printf '%s' "${out:-0}"
+}
+
+ensure_wine_x86() {
+  # x86-64 normally runs Nighty under the distro's own Wine. BUT older Wine
+  # HANGS Nighty during early startup — before the webview stub is even imported,
+  # with no error, just a low-CPU stall (Ubuntu 22.04/24.04 ship Wine 6–9). Wine
+  # >=10 works. So: use the distro Wine only when it is new enough; if it is too
+  # old (or absent) fall back to the same self-contained static build used on ARM
+  # — which here runs natively, no Box64. The system Wine is left untouched.
+  if ! need wine64 && ! need wine; then add "Wine missing"; pm_install wine; fi
+  local bin ver
+  bin="$(command -v wine64 || command -v wine || true)"
+  if [ -n "$bin" ]; then
+    ver="$(wine_major "$bin")"
+    if [ "${ver:-0}" -ge 10 ] 2>/dev/null; then
+      ok "Wine present and new enough (v$ver): $bin"
+      WINE_BIN_RESOLVED="$bin"; return
+    fi
+    warn "Distro Wine is v$ver — too old; Nighty hangs on Wine <10."
+  else
+    warn "Distro Wine is not available from your package manager."
+  fi
+  info "Using a self-contained static Wine build instead (your system Wine is left as-is)…"
+  ensure_wine_static_x86
 }
 
 box64_pkg_for_host() {
@@ -211,11 +234,21 @@ ensure_box64() {
   need box64 && ok "Box64 installed" || die "Could not install Box64 automatically. See https://github.com/ptitSeb/box64 and install it, then re-run."
 }
 
+# Point WINE_BIN_RESOLVED at the static build's launcher: prefer wine64 (the
+# classic amd64 builds, incl. the 10.0 default used on ARM), but accept a lone
+# wine too (newer WoW64-only builds ship a single "wine"). Empty if neither.
+_resolve_static_wine_bin() { # <wine-dir>
+  if   [ -x "$1/bin/wine64" ]; then WINE_BIN_RESOLVED="$1/bin/wine64"
+  elif [ -x "$1/bin/wine" ];   then WINE_BIN_RESOLVED="$1/bin/wine"
+  else WINE_BIN_RESOLVED=""; fi
+}
+
 ensure_wine_static_x86() {
+  ensure xz xz "xz (extractor)"   # the static Wine tarball is .tar.xz
   local wdir="$NIGHTY_HOME/wine" ver="${WINE_VERSION:-10.0}"
-  WINE_BIN_RESOLVED="$wdir/bin/wine64"
-  if [ -x "$WINE_BIN_RESOLVED" ]; then ok "x86-64 Wine present ($wdir)"; return; fi
-  add "x86-64 Wine (static, for Box64) missing — downloading Wine $ver"
+  _resolve_static_wine_bin "$wdir"
+  if [ -n "$WINE_BIN_RESOLVED" ]; then ok "static x86-64 Wine present ($wdir)"; return; fi
+  add "static x86-64 Wine missing — downloading Wine $ver"
   local url="https://github.com/Kron4ek/Wine-Builds/releases/download/${ver}/wine-${ver}-amd64.tar.xz"
   local tgz="$NIGHTY_HOME/.wine-dl.tar.xz"
   info "Fetching $url"
@@ -224,12 +257,13 @@ ensure_wine_static_x86() {
   info "Extracting Wine…"
   tar -xf "$tgz" -C "$wdir" --strip-components=1 || die "Failed to extract the Wine tarball."
   rm -f "$tgz"
-  [ -x "$WINE_BIN_RESOLVED" ] || die "Wine extracted but $WINE_BIN_RESOLVED is missing."
-  ok "x86-64 Wine ready ($wdir)"
+  _resolve_static_wine_bin "$wdir"
+  [ -n "$WINE_BIN_RESOLVED" ] || die "Wine extracted but no wine/wine64 launcher was found in $wdir/bin."
+  ok "static x86-64 Wine ready ($wdir)"
 }
 
 if [ "$IS_X86" = 1 ]; then
-  ensure_wine_native
+  ensure_wine_x86
 else
   ensure_box64
   ensure_wine_static_x86

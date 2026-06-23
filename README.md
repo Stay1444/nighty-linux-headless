@@ -62,7 +62,12 @@ missing**:
 
 - base tools (curl/tar/xz/gnupg), **Python 3**, **Xvfb**, and
   **[`uv`](https://docs.astral.sh/uv/)** (used to fetch Python 3.8 for the repack);
-- on **x86-64** - **Wine** from your distro (Nighty runs natively);
+- on **x86-64** - **Wine** from your distro when it is **version 10 or newer**
+  (Nighty runs natively). Older Wine **hangs Nighty during early startup with no
+  error** (Ubuntu 22.04/24.04 still ship Wine 6-9), so when the distro Wine is too
+  old - or not installed - the installer transparently falls back to the same
+  self-contained **static x86-64 Wine** build used on ARM. Your system Wine is
+  left untouched;
 - on **non-x86** (ARM, etc.) - **Box64** plus a **static x86-64 Wine** build that
   runs under it. Hardware is detected automatically (e.g. the best Box64 build),
   and `run.sh` applies emulator tuning only when needed.
@@ -268,6 +273,13 @@ tools - `uv`, Box64, distro Wine - are always left in place.)
   (Developer Portal → your app → **Bot**), turn on **Presence**, **Server
   Members** and **Message Content**, press **Save Changes**, then **Validate &
   connect** again.
+- **On x86-64, the backend hangs at startup (no `[STUBWV]` logs, `:8765` and
+  `:8090` never bind, no error)** - your distro Wine is too old. Wine 6-9 (shipped
+  by Ubuntu 22.04/24.04) hangs Nighty before the webview stub even loads; Wine 10+
+  fixes it. The installer detects this and falls back to a static Wine build
+  automatically, so just re-run `bash scripts/install.sh`. To force the static
+  build regardless, point `WINE_BIN` in `.env` at it (the installer downloads it
+  to `~/.local/share/nighty/wine`), or pick a specific release with `WINE_VERSION`.
 - **On non-x86 hosts, Wine crashes with illegal-instruction** - you need a
   recent **Box64** built for your CPU; older distro packages may be too old.
 - **The menu prints but typing `1`/`2` does nothing (or "command not found")** -
