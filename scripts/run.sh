@@ -47,8 +47,16 @@ case "$(uname -m)" in
   x86_64|amd64) ARCH_DESC="x86-64 (native Wine)" ;;
   *) ARCH_DESC="$(uname -m) (Wine over Box64)"
      export BOX64_NOBANNER=1 BOX64_LOG=0
-     export BOX64_DYNAREC_BIGBLOCK=0 BOX64_DYNAREC_STRONGMEM=3
-     export BOX64_DYNAREC_SAFEFLAGS=2 BOX64_DYNAREC_CALLRET=0 ;;
+     # Dynarec settings for the emulated x86-64 backend. These default to the
+     # SAFE/conservative values: Nighty bundles a Go-based tls-client whose runtime
+     # crashes on start ("panic on system stack" in schedinit) under more
+     # aggressive dynarec (BIGBLOCK/CALLRET on, relaxed SAFEFLAGS, weaker
+     # STRONGMEM). They are exposed here so you can experiment from .env at your own
+     # risk, but the defaults below are the ones proven stable on this build.
+     : "${BOX64_DYNAREC_BIGBLOCK:=0}"; : "${BOX64_DYNAREC_STRONGMEM:=3}"
+     : "${BOX64_DYNAREC_SAFEFLAGS:=2}"; : "${BOX64_DYNAREC_CALLRET:=0}"
+     export BOX64_DYNAREC_BIGBLOCK BOX64_DYNAREC_STRONGMEM \
+            BOX64_DYNAREC_SAFEFLAGS BOX64_DYNAREC_CALLRET ;;
 esac
 ulimit -s 8192 2>/dev/null || true
 
