@@ -265,6 +265,26 @@ info "Repacking $(basename "$SRC") → $(basename "$OUT") (headless webview stub
 NIGHTY_EXE="$SRC" NIGHTY_STUB="$OUT" "$PY38" scripts/repack.py "$SRC" "$OUT" || die "Repack failed."
 ok "Repack done: $OUT"
 
+# ── 8) lrclib blackhole (performance) ────────────────────────────────────────
+# Nighty's Rich-Presence task (rpcUpdater) fetches song lyrics from lrclib.net
+# with a *blocking* HTTP call made on the bot's asyncio event loop. Under emulation
+# that call can take tens of seconds and freezes the WHOLE bot: the gateway
+# heartbeat times out and slash commands fail with "the application did not
+# respond". Lyrics in Rich Presence are pointless on a headless box, so we point
+# lrclib.net at a dead address — the call then fails instantly instead of hanging.
+info "Performance: blackholing lrclib.net (prevents the lyrics-fetch freeze)…"
+if [ "${BLOCK_LRCLIB:-1}" != 1 ]; then
+  ok "skipped (BLOCK_LRCLIB=0)"
+elif grep -q "nighty-linux-headless: lrclib blackhole" /etc/hosts 2>/dev/null; then
+  ok "already set in /etc/hosts"
+elif printf '\n# nighty-linux-headless: lrclib blackhole (lyrics fetch freezes the bot under emulation)\n0.0.0.0 lrclib.net\n0.0.0.0 api.lrclib.net\n' | $SUDO tee -a /etc/hosts >/dev/null 2>&1; then
+  ok "lrclib.net blackholed in /etc/hosts"
+else
+  warn "could not edit /etc/hosts — add these lines manually (needs root):"
+  warn "    0.0.0.0 lrclib.net"
+  warn "    0.0.0.0 api.lrclib.net"
+fi
+
 # ── done ─────────────────────────────────────────────────────────────────────
 printf '\n%sSetup complete.%s Next:\n\n' "$G" "$N"
 printf '  1) Set your Web UI login in .env:  %sWEBUI_USERNAME%s / %sWEBUI_PASSWORD%s\n' "$B" "$N" "$B" "$N"

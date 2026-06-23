@@ -85,6 +85,12 @@ full_uninstall() {
   [ -f "$NIGHTY_STUB" ] && rm -f "$NIGHTY_STUB" && ok "removed $(basename "$NIGHTY_STUB")"
   [ -f "$NIGHTY_EXE" ]  && rm -f "$NIGHTY_EXE"  && ok "removed $(basename "$NIGHTY_EXE")"
 
+  # remove the lrclib blackhole install.sh added to /etc/hosts
+  if grep -q "nighty-linux-headless: lrclib blackhole" /etc/hosts 2>/dev/null; then
+    $SUDO sed -i '/nighty-linux-headless: lrclib blackhole/d;/^0\.0\.0\.0 lrclib\.net$/d;/^0\.0\.0\.0 api\.lrclib\.net$/d' /etc/hosts \
+      && ok "removed lrclib blackhole from /etc/hosts"
+  fi
+
   echo
   printf '%sDone.%s Nighty is completely removed - the host is back to a pre-install state.\n' "$G" "$N"
   echo "To reinstall: copy your Nighty.exe into this folder and run scripts/install.sh"

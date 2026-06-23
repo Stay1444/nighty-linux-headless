@@ -276,6 +276,15 @@ tools - `uv`, Box64, distro Wine - are always left in place.)
 - **Backend keeps exiting / "Disconnected - Reconnecting"** - make sure the
   headless DLL overrides are active (`run.sh` sets `WINEDLLOVERRIDES` to disable
   .NET/IE/desktop integration, which otherwise abort on a fresh Wine prefix).
+- **Bot is very slow / commands return "the application did not respond"** - on
+  emulated (non-x86) hosts this is caused by Nighty's Rich-Presence task fetching
+  song lyrics from **lrclib.net** with a blocking call on the bot's event loop;
+  under emulation it freezes the whole bot for tens of seconds (the gateway
+  heartbeat times out and slash commands miss Discord's 3-second deadline).
+  `install.sh` blackholes `lrclib.net` in `/etc/hosts` so that call fails
+  instantly (`BLOCK_LRCLIB=1`), `run.sh` applies faster Box64 dynarec tuning, and
+  config enforcement disables the Rich-Presence status rotator. If you still see
+  it, confirm the `/etc/hosts` entry exists and that you restarted the stack.
 
 ## License
 
