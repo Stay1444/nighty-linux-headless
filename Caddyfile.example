@@ -1,0 +1,34 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIONAL production front for nighty-linux-headless.
+#
+# The bundled bridge (scripts/bridge.py) already tunnels Nighty's socket.io
+# WebSockets reliably (select()-based, TCP_NODELAY, keepalive), so you do NOT
+# need this for stable real-time over a plain LAN.
+#
+# Reach for Caddy when you want extras the bridge doesn't do: TLS/HTTPS in one
+# line, HTTP/2, gzip, or fronting a high-traffic / internet-exposed deployment.
+# Caddy proxies HTTP *and* WebSockets natively.
+#
+# Usage:
+#   1) Install Caddy (https://caddyserver.com/docs/install).
+#   2) Copy this to /etc/caddy/Caddyfile (edit the address/port as you like).
+#   3) systemctl reload caddy
+#   4) Open http://<host-ip>:8088/ in your browser.
+#
+# This sends the browser straight to the native Web UI. Use the bundled bridge
+# (on another port, e.g. 8089) only for first-run onboarding if the panel is not
+# up yet.
+# ─────────────────────────────────────────────────────────────────────────────
+
+:8088 {
+	# Native Nighty Web UI (loopback). Caddy upgrades WebSockets automatically.
+	reverse_proxy 127.0.0.1:8090
+
+	encode gzip
+}
+
+# ── Want HTTPS on your LAN? Use a hostname + Caddy's internal CA: ──
+# nighty.lan {
+# 	tls internal
+# 	reverse_proxy 127.0.0.1:8090
+# }

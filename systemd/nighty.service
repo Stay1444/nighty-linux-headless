@@ -1,0 +1,28 @@
+# NOTE: You normally do NOT need to write this file yourself.
+# Running `bash scripts/run.sh` and choosing "2) autostart" installs and
+# enables exactly this unit for you (with the right user and paths filled in).
+#
+# This template is here only for reference / manual installation. If you do it
+# by hand, replace <USER> and <REPO_DIR> with your values, copy it to
+# /etc/systemd/system/nighty.service, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now nighty
+#
+# run.sh brings up the WHOLE stack (Xvfb + config enforcement + Web UI bridge +
+# Nighty backend) and keeps each part alive, so a single service is enough.
+
+[Unit]
+Description=Nighty headless (backend + Web UI bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<USER>
+WorkingDirectory=<REPO_DIR>
+ExecStart=/usr/bin/env bash <REPO_DIR>/scripts/run.sh --run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

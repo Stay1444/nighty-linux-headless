@@ -1,0 +1,27 @@
+# ─── Bring-your-own binary: NEVER commit Nighty ───
+Nighty.exe
+Nighty_stub.exe
+*.exe
+
+# ─── Local secrets / environment ───
+.env
+*.local
+secrets.*
+
+# ─── Wine prefix, runtime data, logs ───
+prefix/
+drive_c/
+*.log
+stub_webview.log
+
+# ─── Python ───
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# ─── Editors / OS ───
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

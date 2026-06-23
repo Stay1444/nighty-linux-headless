@@ -1,0 +1,8 @@
+# This project runs on Linux — keep LF endings so shell scripts stay executable.
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.service text eol=lf
+Caddyfile* text eol=lf
+*.md text eol=lf
+.env.example text eol=lf
