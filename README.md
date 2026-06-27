@@ -297,6 +297,15 @@ tools - `uv`, Box64, distro Wine - are always left in place.)
   instantly (`BLOCK_LRCLIB=1`), `run.sh` applies faster Box64 dynarec tuning, and
   config enforcement disables the Rich-Presence status rotator. If you still see
   it, confirm the `/etc/hosts` entry exists and that you restarted the stack.
+- **The backend crashes when a Rich-Presence preset runs** - on emulated
+  (non-x86) hosts, running an RPC preset makes Nighty fetch its presence assets
+  through the bundled Go `tls-client`, whose JSON handling **intermittently
+  segfaults under Box64** ("access violation" / Go `runtime.sigpanic`) and takes
+  the whole backend down (it then auto-relaunches). Rich Presence has no purpose
+  on a headless selfbot, so the config guard keeps the presence rotator disabled
+  and, if a profile is ever started from the Web UI, stops it again within a few
+  seconds (the same way the UI's toggle does). Leave the rotator off on these
+  hosts; this is a Box64/Nighty emulation limitation, not a bug in this wrapper.
 
 ## License
 

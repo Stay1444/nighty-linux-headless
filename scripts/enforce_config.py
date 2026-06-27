@@ -20,6 +20,7 @@ run.sh — so we never silently fall back to a hardcoded default while a `.env`
 exists.
 """
 import os, sys, json, glob
+import urllib.request
 
 
 def _find_env_file():
@@ -208,6 +209,46 @@ def enforce_rpc_off(appdata):
         _save(path, d)
         return "Rich Presence / status-rotator disabled"
     return "ok (already off)"
+
+
+def _stub_call(method, args=(), api=0, timeout=8):
+    """Invoke a Nighty MainApi method through the stub control server
+    (loopback only). Returns the parsed JSON reply, or None on any failure."""
+    port = env("NIGHTY_STUB_PORT") or env("STUB_PORT", "8765")
+    body = json.dumps({"api": api, "method": method, "args": list(args)}).encode()
+    req = urllib.request.Request(
+        "http://127.0.0.1:%s/api/call" % port, data=body,
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+def enforce_rpc_off_runtime():
+    """Stop a Rich-Presence / status-rotator profile that is running IN MEMORY.
+
+    Setting profile.json running=false on disk does NOT stop an already-running
+    rotator (Nighty drives it from in-memory state). On a headless box under
+    emulation the presence path is also a crash hazard: running an RPC preset
+    makes Nighty fetch its external assets through the bundled Go tls-client,
+    whose JSON handling intermittently segfaults under Box64 and takes the whole
+    backend down. So if a profile is reported running, we stop it the same way
+    the UI does — Nighty's own toggleUserProfile — which cleanly ends the loop."""
+    res = _stub_call("getUserProfiles")
+    if not res or not res.get("ok"):
+        return "skip (stub not ready)"
+    prof = res.get("result") or {}
+    if not prof.get("running"):
+        return "ok (no profile running)"
+    active = prof.get("active_profile")
+    if not active:
+        return "running but no active_profile — left as is"
+    off = _stub_call("toggleUserProfile", [active])
+    if off and off.get("ok"):
+        return "stopped running profile %r" % active
+    return "tried to stop %r (stub busy)" % active
 
 
 def main():
