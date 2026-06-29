@@ -25,3 +25,6 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+
+# ─── graphify knowledge-graph build output (generated) ───
+graphify-out/
