@@ -306,6 +306,13 @@ tools - `uv`, Box64, distro Wine - are always left in place.)
   and, if a profile is ever started from the Web UI, stops it again within a few
   seconds (the same way the UI's toggle does). Leave the rotator off on these
   hosts; this is a Box64/Nighty emulation limitation, not a bug in this wrapper.
+- **"Error downloading sound ... HTTP Error 403: Forbidden"** - Nighty fetches
+  its notification sounds with `urllib`, whose default `User-Agent` the CDN
+  (Cloudflare) blocks with 403, so the sound never lands and the error repeats on
+  every matching event. The config enforcer pre-seeds `data/sounds/` with those
+  files using a browser `User-Agent` at launch, so Nighty's download-if-missing
+  path skips the blocked request. If a different sound shows the same 403, add its
+  file name to `SOUND_FILES` in `scripts/enforce_config.py`.
 
 ## License
 
