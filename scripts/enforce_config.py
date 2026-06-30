@@ -105,10 +105,26 @@ def _load(path):
 
 
 def _save(path, obj):
+    # Nighty reads these files with the process default encoding — cp1252 under
+    # Wine, exactly as on Windows. Any raw non-ASCII byte we write here (e.g. an
+    # emoji inside a Rich-Presence / Custom-Status profile) makes Nighty's own
+    # read raise UnicodeDecodeError('charmap', …) and return HTTP 500 on save.
+    # So we escape non-ASCII (ensure_ascii=True), matching how Nighty itself
+    # writes the file and keeping it pure-ASCII and round-trippable.
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=4, ensure_ascii=False)
+        json.dump(obj, f, indent=4, ensure_ascii=True)
     os.replace(tmp, path)
+
+
+def _has_non_ascii(path):
+    """True if the file on disk contains any byte > 127 (i.e. it was written with
+    raw UTF-8 and is unreadable by Nighty's cp1252 reader)."""
+    try:
+        with open(path, "rb") as f:
+            return any(b > 127 for b in f.read())
+    except OSError:
+        return False
 
 
 def _disable_bools(node):
@@ -205,8 +221,16 @@ def enforce_rpc_off(appdata):
         if d.get(k) is not False:
             d[k] = False
             changed = True
-    if changed:
+    # Heal a file that an older build poisoned with raw UTF-8 bytes (e.g. emoji in
+    # the default "Custom Status Rotator" profile). Once running/run_at_startup are
+    # already False we would never rewrite it, so Nighty's cp1252 read keeps failing
+    # and the panel's "save profile" stays broken (HTTP 500). Re-saving via _save
+    # (now ensure_ascii=True) normalises it back to ASCII so Nighty can read it.
+    poisoned = _has_non_ascii(path)
+    if changed or poisoned:
         _save(path, d)
+        if poisoned:
+            return "Rich Presence / status-rotator disabled (+normalised encoding)"
         return "Rich Presence / status-rotator disabled"
     return "ok (already off)"
 
