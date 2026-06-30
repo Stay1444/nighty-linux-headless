@@ -11,10 +11,12 @@ Web UI, this guard re-asserts it within a few seconds:
 
 It also keeps data/profile.json ASCII-encoded so Nighty (which reads it with the
 cp1252 default under Wine) can always read it back; otherwise emoji in a profile
-make the panel's "save profile" fail with HTTP 500. The Rich-Presence rotator and
-its "Run last active profile on startup" option are left under the user's control
-(an earlier build force-disabled them to dodge a Box64 crash, which also reverted
-the user's startup choice).
+make the panel's "save profile" fail with HTTP 500.
+
+For Rich Presence it is type-aware: only RPC presets crash the backend under
+Box64 (image-asset fetch), so it disables auto-start / stops in memory ONLY for
+RPC-type active profiles. Custom-status rotators are safe and left under the
+user's control, so "Run last active profile on startup" works for them.
 
 Started in the background by run.sh (and supervised by systemd). It writes only
 when something actually changed, so it never fights Nighty's own writes.
@@ -36,7 +38,9 @@ def main():
             appdata = ec.find_appdata()
             if appdata:
                 ec.enforce_web(appdata)
-                ec.normalize_profile_encoding(appdata)   # keep profile.json cp1252-readable
+                ec.enforce_safe_presence(appdata)     # heal encoding; disable only RPC auto-start
+            # Stop an RPC preset already running in memory (no-op for safe profiles).
+            ec.stop_unsafe_running_profile()
         except Exception as e:
             print("[guard] error:", repr(e))
         time.sleep(interval)

@@ -298,16 +298,14 @@ tools - `uv`, Box64, distro Wine - are always left in place.)
   config enforcement disables the Rich-Presence status rotator. If you still see
   it, confirm the `/etc/hosts` entry exists and that you restarted the stack.
 - **A Rich-Presence preset can crash the backend under emulation** - on emulated
-  (non-x86) hosts, running an RPC preset that fetches **image assets** makes
-  Nighty pull them through the bundled Go `tls-client`, whose JSON handling
-  **intermittently segfaults under Box64** ("access violation" / Go
-  `runtime.sigpanic`) and takes the whole backend down (it then auto-relaunches).
-  The presence rotator and the Web UI's "Run last active profile on startup"
-  option are left enabled and under your control; presets without external image
-  assets (an elapsed-time RPC, a plain custom-status rotator) run fine. If a
-  particular preset crash-loops at startup on one of these hosts, turn off
-  "Run last active profile on startup" in the Web UI. This is a Box64/Nighty
-  emulation limitation, not a bug in this wrapper.
+  (non-x86) hosts, running an **RPC** preset makes Nighty fetch image assets
+  through the bundled Go `tls-client`, whose JSON handling **intermittently
+  segfaults under Box64** ("access violation" / Go `runtime.sigpanic`) and takes
+  the whole backend down (it then auto-relaunches). The config guard is
+  type-aware: it disables auto-start (and stops in memory) only for **RPC**
+  profiles, the crashing kind. So the Web UI's "Run last active profile on
+  startup" is honored for safe **custom-status** rotators but suppressed for RPC
+  presets. This is a Box64/Nighty emulation limitation, not a bug in this wrapper.
 - **"Error downloading sound ... HTTP Error 403: Forbidden"** - Nighty fetches
   its notification sounds with `urllib`, whose default `User-Agent` the CDN
   (Cloudflare) blocks with 403, so the sound never lands and the error repeats on

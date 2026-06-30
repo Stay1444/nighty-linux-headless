@@ -205,32 +205,87 @@ def enforce_web(appdata):
     return "; ".join(msgs)
 
 
-def normalize_profile_encoding(appdata):
-    """Keep data/profile.json readable by Nighty under Wine.
+def _active_profile_is_rpc(d):
+    """True if the active profile contains an 'rpc' entry. RPC presets make Nighty
+    fetch image assets through the bundled Go tls-client, whose JSON handling
+    intermittently segfaults under Box64 and takes the whole backend down.
+    Custom-status rotators (text/emoji only) do not fetch those assets and are
+    safe to auto-run. `d` is either profile.json or the getUserProfiles result —
+    both carry {active_profile, profiles}."""
+    active = d.get("active_profile")
+    for p in d.get("profiles", []) or []:
+        if isinstance(p, dict) and active in p:
+            return any(isinstance(e, dict) and "rpc" in e for e in (p.get(active) or []))
+    return False
 
-    Nighty reads its config/state JSON with the process default encoding (cp1252
-    under Wine, exactly as on Windows), so a file holding raw non-ASCII bytes
-    (e.g. emoji in a Rich-Presence profile) makes Nighty's own read raise
-    UnicodeDecodeError and the panel's "save profile" return HTTP 500. If the
-    on-disk file has any non-ASCII byte, re-save it via _save (ensure_ascii=True)
-    to normalise it back to ASCII.
 
-    This deliberately does NOT touch `running` / `run_at_startup`: the Web UI's
-    "Run last active profile on startup" option is left under the user's control.
-    Earlier builds force-disabled the presence rotator here (and stopped it in
-    memory) to dodge an intermittent Box64 segfault in Nighty's bundled Go
-    tls-client while fetching RPC image assets — but that also silently reverted
-    this user-facing option, so the suppression was removed. Presets that fetch
-    external image assets may still occasionally crash the backend under
-    emulation; the backend auto-relaunches (see scripts/run.sh)."""
+def enforce_safe_presence(appdata):
+    """Keep data/profile.json readable by Nighty, and stop only crash-prone
+    presets from auto-running — without clobbering the user's startup choice for
+    safe ones.
+
+      • Encoding: Nighty reads this file with the cp1252 default under Wine, so a
+        raw non-ASCII byte (emoji in a profile) makes its read raise
+        UnicodeDecodeError and the panel's "save profile" return HTTP 500. We
+        re-save via _save (ensure_ascii=True) whenever the file holds non-ASCII.
+      • Crash safety: only RPC presets crash the backend under Box64 (image-asset
+        fetch). So we force running/run_at_startup off ONLY when the active
+        profile is RPC-type. Custom-status rotators are left under the user's
+        control, so the Web UI's "Run last active profile on startup" works for
+        them."""
     path = os.path.join(appdata, "data", "profile.json")
-    if not _has_non_ascii(path):
-        return "ok (ascii)"
     d = _load(path)
     if not isinstance(d, dict):
-        return "skip (unreadable profile.json)"
-    _save(path, d)
-    return "normalised encoding"
+        return "skip (no profile.json)"
+    changed = False
+    if _active_profile_is_rpc(d):
+        note = "RPC profile — auto-start disabled (Box64 crash hazard)"
+        for k in ("running", "run_at_startup"):
+            if d.get(k) is not False:
+                d[k] = False
+                changed = True
+    else:
+        note = "custom-status profile — startup left to user"
+    if changed or _has_non_ascii(path):
+        _save(path, d)
+    return note
+
+
+def _stub_call(method, args=(), api=0, timeout=8):
+    """Invoke a Nighty MainApi method through the loopback stub control server.
+    Returns the parsed JSON reply, or None on any failure."""
+    port = env("NIGHTY_STUB_PORT") or env("STUB_PORT", "8765")
+    body = json.dumps({"api": api, "method": method, "args": list(args)}).encode()
+    req = urllib.request.Request(
+        "http://127.0.0.1:%s/api/call" % port, data=body,
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+def stop_unsafe_running_profile():
+    """Stop an RPC profile running IN MEMORY (the on-disk flag alone does not halt
+    an already-running rotator). Leaves safe custom-status profiles running, so
+    the user's startup choice is honoured for them. Cheap no-op when nothing runs
+    or the runner is a custom-status profile."""
+    res = _stub_call("getUserProfiles")
+    if not res or not res.get("ok"):
+        return "skip (stub not ready)"
+    prof = res.get("result") or {}
+    if not prof.get("running"):
+        return "ok (nothing running)"
+    if not _active_profile_is_rpc(prof):
+        return "ok (running profile is safe custom-status)"
+    active = prof.get("active_profile")
+    if not active:
+        return "running RPC but no active_profile"
+    off = _stub_call("toggleUserProfile", [active])
+    if off and off.get("ok"):
+        return "stopped unsafe RPC profile %r" % active
+    return "tried to stop %r (stub busy)" % active
 
 
 # Notification sounds Nighty fetches on demand from its CDN. Nighty downloads
@@ -297,7 +352,7 @@ def main():
     print("[enforce] appdata:", appdata)
     print("[enforce] notifications:", enforce_notifications(appdata))
     print("[enforce] web:", enforce_web(appdata))
-    print("[enforce] profile:", normalize_profile_encoding(appdata))
+    print("[enforce] profile:", enforce_safe_presence(appdata))
     print("[enforce] sounds:", prefetch_sounds(appdata))
     return 0
 
