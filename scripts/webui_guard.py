@@ -9,12 +9,12 @@ Web UI, this guard re-asserts it within a few seconds:
   • nighty.config  -> web = true
   • web_config.json -> the credentials/host/port from .env
 
-It also keeps the Rich-Presence / status-rotator profile from running: on a
-headless box that presence machinery has no purpose, and running an RPC preset
-makes Nighty fetch external assets through the bundled Go tls-client, which
-intermittently segfaults under emulation (Box64) and crashes the whole backend.
-If a profile is ever started (e.g. from the Web UI), the guard stops it again
-the same way the UI does — Nighty's own toggle — within one interval.
+It also keeps data/profile.json ASCII-encoded so Nighty (which reads it with the
+cp1252 default under Wine) can always read it back; otherwise emoji in a profile
+make the panel's "save profile" fail with HTTP 500. The Rich-Presence rotator and
+its "Run last active profile on startup" option are left under the user's control
+(an earlier build force-disabled them to dodge a Box64 crash, which also reverted
+the user's startup choice).
 
 Started in the background by run.sh (and supervised by systemd). It writes only
 when something actually changed, so it never fights Nighty's own writes.
@@ -36,10 +36,7 @@ def main():
             appdata = ec.find_appdata()
             if appdata:
                 ec.enforce_web(appdata)
-                ec.enforce_rpc_off(appdata)        # keep profile.json off on disk
-            # And stop it in memory if it is running (the on-disk flag alone does
-            # not halt an already-running rotator). Cheap no-op when nothing runs.
-            ec.enforce_rpc_off_runtime()
+                ec.normalize_profile_encoding(appdata)   # keep profile.json cp1252-readable
         except Exception as e:
             print("[guard] error:", repr(e))
         time.sleep(interval)

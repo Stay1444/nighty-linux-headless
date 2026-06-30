@@ -205,74 +205,32 @@ def enforce_web(appdata):
     return "; ".join(msgs)
 
 
-def enforce_rpc_off(appdata):
-    """Headless hardening: keep Nighty's Rich Presence / status-rotator profile
-    from running at startup. A headless selfbot has no reason to broadcast a
-    rotating custom status or Rich Presence, and that presence machinery is part
-    of what keeps the bot's event loop busy. (The biggest offender — the lyrics
-    fetch the presence task makes — is neutralised at the network level; see the
-    lrclib blackhole in install.sh.)"""
+def normalize_profile_encoding(appdata):
+    """Keep data/profile.json readable by Nighty under Wine.
+
+    Nighty reads its config/state JSON with the process default encoding (cp1252
+    under Wine, exactly as on Windows), so a file holding raw non-ASCII bytes
+    (e.g. emoji in a Rich-Presence profile) makes Nighty's own read raise
+    UnicodeDecodeError and the panel's "save profile" return HTTP 500. If the
+    on-disk file has any non-ASCII byte, re-save it via _save (ensure_ascii=True)
+    to normalise it back to ASCII.
+
+    This deliberately does NOT touch `running` / `run_at_startup`: the Web UI's
+    "Run last active profile on startup" option is left under the user's control.
+    Earlier builds force-disabled the presence rotator here (and stopped it in
+    memory) to dodge an intermittent Box64 segfault in Nighty's bundled Go
+    tls-client while fetching RPC image assets — but that also silently reverted
+    this user-facing option, so the suppression was removed. Presets that fetch
+    external image assets may still occasionally crash the backend under
+    emulation; the backend auto-relaunches (see scripts/run.sh)."""
     path = os.path.join(appdata, "data", "profile.json")
+    if not _has_non_ascii(path):
+        return "ok (ascii)"
     d = _load(path)
     if not isinstance(d, dict):
-        return "skip (no profile.json)"
-    changed = False
-    for k in ("running", "run_at_startup"):
-        if d.get(k) is not False:
-            d[k] = False
-            changed = True
-    # Heal a file that an older build poisoned with raw UTF-8 bytes (e.g. emoji in
-    # the default "Custom Status Rotator" profile). Once running/run_at_startup are
-    # already False we would never rewrite it, so Nighty's cp1252 read keeps failing
-    # and the panel's "save profile" stays broken (HTTP 500). Re-saving via _save
-    # (now ensure_ascii=True) normalises it back to ASCII so Nighty can read it.
-    poisoned = _has_non_ascii(path)
-    if changed or poisoned:
-        _save(path, d)
-        if poisoned:
-            return "Rich Presence / status-rotator disabled (+normalised encoding)"
-        return "Rich Presence / status-rotator disabled"
-    return "ok (already off)"
-
-
-def _stub_call(method, args=(), api=0, timeout=8):
-    """Invoke a Nighty MainApi method through the stub control server
-    (loopback only). Returns the parsed JSON reply, or None on any failure."""
-    port = env("NIGHTY_STUB_PORT") or env("STUB_PORT", "8765")
-    body = json.dumps({"api": api, "method": method, "args": list(args)}).encode()
-    req = urllib.request.Request(
-        "http://127.0.0.1:%s/api/call" % port, data=body,
-        headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8", "replace"))
-    except Exception:
-        return None
-
-
-def enforce_rpc_off_runtime():
-    """Stop a Rich-Presence / status-rotator profile that is running IN MEMORY.
-
-    Setting profile.json running=false on disk does NOT stop an already-running
-    rotator (Nighty drives it from in-memory state). On a headless box under
-    emulation the presence path is also a crash hazard: running an RPC preset
-    makes Nighty fetch its external assets through the bundled Go tls-client,
-    whose JSON handling intermittently segfaults under Box64 and takes the whole
-    backend down. So if a profile is reported running, we stop it the same way
-    the UI does — Nighty's own toggleUserProfile — which cleanly ends the loop."""
-    res = _stub_call("getUserProfiles")
-    if not res or not res.get("ok"):
-        return "skip (stub not ready)"
-    prof = res.get("result") or {}
-    if not prof.get("running"):
-        return "ok (no profile running)"
-    active = prof.get("active_profile")
-    if not active:
-        return "running but no active_profile — left as is"
-    off = _stub_call("toggleUserProfile", [active])
-    if off and off.get("ok"):
-        return "stopped running profile %r" % active
-    return "tried to stop %r (stub busy)" % active
+        return "skip (unreadable profile.json)"
+    _save(path, d)
+    return "normalised encoding"
 
 
 # Notification sounds Nighty fetches on demand from its CDN. Nighty downloads
@@ -339,7 +297,7 @@ def main():
     print("[enforce] appdata:", appdata)
     print("[enforce] notifications:", enforce_notifications(appdata))
     print("[enforce] web:", enforce_web(appdata))
-    print("[enforce] presence:", enforce_rpc_off(appdata))
+    print("[enforce] profile:", normalize_profile_encoding(appdata))
     print("[enforce] sounds:", prefetch_sounds(appdata))
     return 0
 
