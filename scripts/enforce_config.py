@@ -275,6 +275,62 @@ def enforce_rpc_off_runtime():
     return "tried to stop %r (stub busy)" % active
 
 
+# Notification sounds Nighty fetches on demand from its CDN. Nighty downloads
+# them with urllib, whose default User-Agent ("Python-urllib/x.y") Cloudflare
+# rejects with HTTP 403 — so the file never lands in data/sounds/ and Nighty
+# retries on every matching event (the user-visible "Error downloading sound
+# nicknames.mp3 (…/sounds/nickupdates.mp3): HTTP Error 403: Forbidden"). We
+# fetch them once with a browser User-Agent (which the CDN serves with 200) so
+# they sit on disk and Nighty's download-if-missing path never makes the
+# blocked request. The mapping of notification category -> file name lives in
+# Nighty's frozen code; this is the set confirmed to exist on the CDN. Add a
+# name here if a new notification sound shows the same 403.
+SOUND_BASE = "https://nighty.one/download/files/sounds"
+SOUND_FILES = ("connected.mp3", "roleupdates.mp3", "nickupdates.mp3")
+_BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+
+def prefetch_sounds(appdata):
+    """Pre-seed data/sounds/ with the CDN sounds Nighty would otherwise fail to
+    download (Cloudflare 403s its urllib User-Agent). Idempotent and fail-soft:
+    skips files already present and never raises into the launch path."""
+    dest = os.path.join(appdata, "data", "sounds")
+    try:
+        os.makedirs(dest, exist_ok=True)
+    except OSError:
+        return "skip (no sounds dir)"
+    have, fetched, failed = 0, [], []
+    for name in SOUND_FILES:
+        path = os.path.join(dest, name)
+        try:
+            if os.path.getsize(path) > 0:
+                have += 1
+                continue
+        except OSError:
+            pass
+        try:
+            req = urllib.request.Request("%s/%s" % (SOUND_BASE, name),
+                                         headers={"User-Agent": _BROWSER_UA})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = r.read()
+            if not data:
+                raise ValueError("empty body")
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+            fetched.append(name)
+        except Exception as e:
+            failed.append("%s (%s)" % (name, e))
+    msg = "%d already present" % have
+    if fetched:
+        msg += ", fetched %d" % len(fetched)
+    if failed:
+        msg += ", failed: %s" % ", ".join(failed)
+    return msg
+
+
 def main():
     appdata = find_appdata()
     if not appdata:
@@ -284,6 +340,7 @@ def main():
     print("[enforce] notifications:", enforce_notifications(appdata))
     print("[enforce] web:", enforce_web(appdata))
     print("[enforce] presence:", enforce_rpc_off(appdata))
+    print("[enforce] sounds:", prefetch_sounds(appdata))
     return 0
 
 
