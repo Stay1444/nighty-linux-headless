@@ -115,28 +115,37 @@ bash scripts/run.sh autostart   # install + enable the systemd service
 > When using the menu, don't background it with `&` - a backgrounded prompt
 > can't read your keypress. Use `run.sh autostart` (or run it in the foreground).
 
-Then open `http://<host-ip>:8088/` in a browser. First run walks you through
-these steps:
+Then open `http://<host-ip>:8088/` in a browser. First run is a single guided
+wizard that collects everything up front, validates each step against Discord,
+then writes Nighty's config directly so the backend boots fully set up in **one**
+start (no simulating Nighty or waiting between steps):
 
 1. **Activate** - paste your **Nighty license key** (from your Nighty purchase /
    dashboard). Nighty needs it to run: without a license the bot can sign in but
    `on_ready` aborts before its commands are registered, so it looks online yet
-   **no command works**. The bridge saves the key for you.
-2. **Sign in** - paste your Discord account token.
+   **no command works**.
+2. **Sign in** - paste your Discord **account token**. The bridge validates it
+   against Discord and resolves the username used as the login key.
 3. **Connect your bot** - paste your **bot token** (Developer Portal → your app
-   → **Bot** → *Reset Token*). The bridge verifies it with Discord *before*
-   handing it to Nighty: it confirms the token is valid and that the required
-   **privileged intents** (Presence, Server Members, Message Content) are
-   enabled. If any are off, it shows you exactly which ones and links you
-   straight to the right settings page - flip them on, hit **Save Changes**,
-   then re-check. Pasting the token yourself avoids the developer-portal
-   password and captcha entirely.
-4. **Authorize** *(only if your bot isn't linked yet)* - if the bot has never
-   been authorized on your Discord, Nighty won't finish starting and the bridge
-   shows an **Authorize** page with a direct Discord OAuth link for your own
-   application. Click it, approve the bot on Discord, then press *continue* - the
-   bridge restarts Nighty so it picks up the authorization. You won't see this
-   step if the bot is already authorized.
+   → **Bot** → *Reset Token*). The bridge verifies it with Discord: a valid token
+   with the required **privileged intents** (Presence, Server Members, Message
+   Content). If any are off it shows exactly which, and links straight to the
+   settings page - flip them on, Save Changes, then continue.
+4. **Authorize** - open the **Authorize on Discord** link and approve the bot on
+   your account. This is a strict gate: the wizard **refuses to finish and start
+   Nighty until the bot is actually linked**, so you never end up with a bot that
+   is online but unauthorized.
+
+On **Finish** the bridge writes `auth.json` (license) and the account/bot login
+into `nighty.config` directly, then starts Nighty once. Pasting the tokens
+yourself avoids the developer-portal password and captcha entirely.
+
+### Adding another account
+
+Run `bash scripts/add_account.sh` on the host. It re-opens the same wizard in the
+Web UI, retitled **"Add account"**, runs the identical validation and OAuth gate,
+and writes the new login straight into `nighty.config` (making it the active
+account) before restarting Nighty. Ctrl+C cancels and restores the panel.
 
 After that the native Web UI loads.
 
@@ -183,8 +192,9 @@ nighty-linux-headless/
 │   ├── repack.py            Nighty.exe -> Nighty_stub.exe (headless stub)
 │   ├── enforce_config.py    notifications off + Web UI creds + web:true
 │   ├── webui_guard.py       continuous "Web UI always on" enforcement
+│   ├── add_account.sh       add another Discord account (re-opens the wizard)
 │   ├── run.sh               orchestrator: starts the whole stack + autostart menu
-│   └── bridge.py            LAN reverse-proxy to the native Web UI
+│   └── bridge.py            LAN reverse-proxy + onboarding wizard + provisioning
 ├── systemd/
 │   └── nighty.service       reference unit (run.sh installs this for you)
 └── docs/

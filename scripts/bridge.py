@@ -221,6 +221,165 @@ def submit_bot_token(token):
     return {"ok": True, "app_id": chk.get("app_id"), "bot_name": chk.get("bot_name")}
 
 
+def _discord_account_get(token, path):
+    """GET discord.com/api/v10 authenticated as a USER account (raw token, no
+    'Bot ' prefix). Returns (status, json|None)."""
+    req = urllib.request.Request("https://discord.com/api/v10" + path, headers={
+        "Authorization": token,
+        "User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=20, context=_ctx) as r:
+            return r.status, json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode("utf-8", "replace"))
+        except Exception:
+            return e.code, None
+    except Exception:
+        return -1, None
+
+
+def check_account_token(token):
+    """Validate a Discord ACCOUNT token against the API. Returns {ok, username,
+    id} on success or {ok:False, error}. The username becomes the login key in
+    nighty.config, so we resolve it here rather than trusting the browser."""
+    token = (token or "").strip()
+    if not token:
+        return {"ok": False, "error": "Paste your account token first."}
+    st, me = _discord_account_get(token, "/users/@me")
+    if st == 401 or not (isinstance(me, dict) and me.get("id")):
+        return {"ok": False, "error": "Discord rejected this account token. "
+                "Copy the whole token (not your password) and try again."}
+    return {"ok": True, "id": me.get("id"), "username": me.get("username") or me.get("id")}
+
+
+def _bot_authorized(token, app):
+    """Strict OAuth gate: has the bot actually been authorized/installed anywhere
+    yet (invited to at least one guild, or installed on at least one account)?
+    This is how we know the user completed the Discord authorize step before we
+    write the config and boot the backend."""
+    _, gl = _discord_bot_get(token, "/users/@me/guilds")
+    guilds = len(gl) if isinstance(gl, list) else 0
+    users = (app or {}).get("approximate_user_install_count") or 0
+    return bool(guilds) or bool(users)
+
+
+def _write_auth_license(key):
+    """Write the Nighty license into auth.json directly (merging any other keys)."""
+    p = _auth_path()
+    if not p:
+        return False
+    d = {}
+    if os.path.exists(p):
+        try:
+            d = json.load(open(p, encoding="utf-8")) or {}
+        except Exception:
+            d = {}
+    d["license"] = key
+    tmp = p + ".tmp"
+    json.dump(d, open(tmp, "w", encoding="utf-8"), indent=4, ensure_ascii=False)
+    os.replace(tmp, p)
+    return True
+
+
+def _write_login(username, account_token, app_id, bot_token, make_active=True):
+    """Merge one account into nighty.config.logins in Nighty's own on-disk shape,
+    so a single backend start boots fully configured. Preserves every other key
+    Nighty wrote (its defaults, and any other accounts). When make_active, this
+    login becomes the active one and the rest are deactivated."""
+    appdata = find_appdata()
+    if not appdata:
+        return False
+    cfg = os.path.join(appdata, "nighty.config")
+    d = {}
+    if os.path.exists(cfg):
+        try:
+            d = json.load(open(cfg, encoding="utf-8")) or {}
+        except Exception:
+            d = {}
+    logins = d.get("logins")
+    if not isinstance(logins, dict):
+        logins = {}
+    if make_active:
+        for info in logins.values():
+            if isinstance(info, dict):
+                info["active"] = False
+    logins[username] = {
+        "token": account_token,
+        "date_added": time.strftime("%d %B %Y, at %H:%M:%S"),
+        "active": bool(make_active),
+        "app": {"id": app_id, "token": bot_token},
+    }
+    d["logins"] = logins
+    d["web"] = True
+    tmp = cfg + ".tmp"
+    json.dump(d, open(tmp, "w", encoding="utf-8"), indent=4, ensure_ascii=False)
+    os.replace(tmp, cfg)
+    return True
+
+
+def _add_account_path():
+    ad = find_appdata()
+    return os.path.join(ad, ".add_account") if ad else None
+
+
+def add_account_active():
+    """True while add_account.sh has put the box into 'add another account' mode.
+    In that mode the bridge re-serves the setup wizard (retitled) even though the
+    box is already onboarded/locked, so a second account can be provisioned."""
+    p = _add_account_path()
+    return bool(p and os.path.exists(p))
+
+
+def _clear_add_account():
+    p = _add_account_path()
+    try:
+        if p and os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
+
+
+def provision(license_key, account_token, bot_token, make_active=True, restart=True):
+    """One-shot onboarding. Validate the license/tokens against Discord, enforce
+    the OAuth gate, then write auth.json + nighty.config directly so Nighty boots
+    fully set up in a single start (no step-by-step stub feeding or restarts).
+    Returns {ok:True, username, bot_name} or {ok:False, step, error, ...}."""
+    license_key = (license_key or "").strip()
+    account_token = (account_token or "").strip()
+    bot_token = (bot_token or "").strip()
+    if not (license_key and account_token and bot_token):
+        return {"ok": False, "error": "License, account token and bot token are all required."}
+    acct = check_account_token(account_token)
+    if not acct.get("ok"):
+        return {"ok": False, "step": "account", "error": acct.get("error")}
+    chk = check_bot_token(bot_token)
+    if not chk.get("valid"):
+        return {"ok": False, "step": "bot", "error": chk.get("error")}
+    if not chk.get("intents_ok"):
+        return {"ok": False, "step": "bot", "needs_intents": True,
+                "missing": chk.get("missing"), "intents_url": chk.get("intents_url"),
+                "error": "Enable the required intents, then finish."}
+    _, app = _discord_bot_get(bot_token, "/applications/@me")
+    app = app if isinstance(app, dict) else {}
+    app_id = chk.get("app_id")
+    if not _bot_authorized(bot_token, app):
+        return {"ok": False, "step": "oauth",
+                "authorize_url": bot_authorize_url(app_id, _app_integration_types(app)),
+                "error": "The bot is not authorized yet. Open 'Authorize on Discord', "
+                         "approve it, then press finish."}
+    if not _write_auth_license(license_key):
+        return {"ok": False, "error": "Could not write the license file."}
+    if not _write_login(acct["username"], account_token, app_id, bot_token, make_active=make_active):
+        return {"ok": False, "error": "Could not write the account into nighty.config."}
+    if restart:
+        try:
+            os.system("pkill -f '[N]ighty_stub'")
+        except Exception:
+            pass
+    return {"ok": True, "username": acct["username"], "bot_name": chk.get("bot_name")}
+
+
 def fetch(url):
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Encoding": "identity"})
     with urllib.request.urlopen(req, timeout=15, context=_ctx) as r:
@@ -582,22 +741,17 @@ def get_state():
         # authorization screen — boot straight into the working state. (Reset is
         # only possible via uninstall.sh's 'Reset Configuration Only'.)
         mode = "main"
-    elif not license_set():
-        # The license is the very first thing Nighty needs — gate before sign-in.
-        mode = "license"
-    elif saved_account_token() and saved_bot_token():
-        # Fully onboarded. Authorization is gated on whether the bot is actually
-        # linked (bot_link_status), NOT on whether Nighty served the panel — Nighty
-        # boots and serves it even when the bot is disconnected, so we must check
-        # the link explicitly and present the authorize step when it is broken.
-        if not bot_link_status()["connected"]:
-            mode = "authorize"
-        else:
-            mode = "main"
-    elif ("app_token.html" in cur) or ("discord.com" in master_url) or ("AppCreateApi" in types) or ("BotTokenApi" in types):
-        mode = "bottoken"
-    elif (not cur) or any(m in cur for m in login_markers):
-        mode = "login"
+    elif not _onboarded():
+        # Not fully onboarded yet (license, account token or bot token missing).
+        # The new wizard collects everything client-side and provisions in one
+        # shot, so we no longer track Nighty's per-screen sub-state — a single
+        # 'setup' mode drives the whole flow regardless of Nighty's current page.
+        mode = "setup"
+    elif not bot_link_status()["connected"]:
+        # Onboarded but the bot is not actually linked (Nighty boots and serves
+        # the panel even when the bot is disconnected, so check the link
+        # explicitly) — present the authorization backstop.
+        mode = "authorize"
     else:
         mode = "main"
     # Acquire the lock the first time a complete, working setup is observed: the
@@ -612,27 +766,58 @@ def get_state():
             "ready": bool(web_up())}
 
 
-CSS = """:root{--bg:#0b0f1a;--card:#121826;--card2:#0e1422;--line:#1e2942;--txt:#e7ecf6;--mut:#8a97b1;--ac:#3b82f6;--ac2:#60a5fa;--ok:#22c55e;--err:#ef4444}
-*{box-sizing:border-box}body{margin:0;font-family:'Segoe UI',system-ui,Arial,sans-serif;color:var(--txt);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;
-background:radial-gradient(1200px 600px at 80% -10%,#16223f 0,transparent 60%),radial-gradient(900px 500px at -10% 110%,#0f1b33 0,transparent 55%),var(--bg)}
-.card{width:100%;max-width:480px;background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--line);border-radius:18px;padding:34px 32px;box-shadow:0 30px 80px rgba(0,0,0,.55)}
-.logo{display:flex;align-items:center;gap:12px;margin-bottom:6px}.logo .mark{width:40px;height:40px;border-radius:11px;background:linear-gradient(135deg,#2563eb,#22d3ee);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:22px;color:#fff}
-h1{font-size:20px;margin:0;font-weight:700}.sub{color:var(--mut);font-size:13px;margin:4px 0 20px}
-label{display:block;font-size:12px;color:var(--mut);margin:14px 0 7px;text-transform:uppercase;letter-spacing:.6px}
-input{width:100%;background:#0a0f1c;border:1px solid var(--line);border-radius:11px;color:var(--txt);padding:13px 14px;font-size:14px;outline:none}
-input:focus{border-color:var(--ac);box-shadow:0 0 0 3px rgba(59,130,246,.18)}
-ol{color:var(--mut);font-size:13px;line-height:1.7;padding-left:18px;margin:6px 0 0}ol b{color:var(--txt)}
-a.btnlink{display:inline-block;margin-top:10px;color:var(--ac2);text-decoration:none;font-size:13px;border:1px solid var(--line);padding:8px 12px;border-radius:9px}
-button.primary{width:100%;margin-top:18px;background:linear-gradient(135deg,var(--ac),#2563eb);border:0;color:#fff;font-size:15px;font-weight:600;padding:13px;border-radius:11px;cursor:pointer}
-button.primary:disabled{opacity:.55;cursor:not-allowed}
-.status{margin-top:16px;font-size:13px;min-height:20px;color:var(--mut);display:flex;align-items:center;gap:8px}
-.status.ok{color:var(--ok)}.status.err{color:var(--err)}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--mut)}.dot.ok{background:var(--ok)}.dot.err{background:var(--err)}.dot.busy{background:var(--ac2);animation:p 1s infinite}@keyframes p{0%,100%{opacity:.3}50%{opacity:1}}
-.foot{margin-top:20px;border-top:1px solid var(--line);padding-top:14px;color:#5d6a86;font-size:11px;line-height:1.6}
-.intents{display:none;margin-top:14px;background:#1c1407;border:1px solid #5a3a12;border-radius:11px;padding:12px 14px}
-.intents .ih{color:#f4c47a;font-size:13px;margin-bottom:6px;font-weight:600}
-.intents ul{margin:0 0 9px;padding-left:20px;color:var(--txt);font-size:13px;line-height:1.7}
-.intents .hint{color:#9c8456;font-size:12px;margin-top:8px}"""
+CSS = """:root{--bg:#080a0f;--panel:#0f131c;--panel-2:#0c0f17;--line:#1b2233;--line-2:#232c42;
+--txt:#eef2fb;--mut:#8b96ad;--mut-2:#5c6885;--brand:#6d8bff;--brand-2:#8ba6ff;--ok:#37d399;--err:#ff6b6b;--warn:#f5b544;--radius:14px}
+*{box-sizing:border-box}html,body{height:100%}
+body{margin:0;font-family:'Inter','Segoe UI',system-ui,-apple-system,Arial,sans-serif;color:var(--txt);background:var(--bg);
+display:flex;align-items:center;justify-content:center;padding:24px;line-height:1.5;-webkit-font-smoothing:antialiased;
+background-image:radial-gradient(60rem 40rem at 88% -12%,rgba(109,139,255,.10),transparent 60%),radial-gradient(50rem 40rem at -10% 110%,rgba(55,211,153,.06),transparent 55%)}
+.shell{width:100%;max-width:440px}
+.brand{display:flex;align-items:center;gap:11px;margin:0 2px 18px}
+.brand .mark{width:34px;height:34px;border-radius:9px;display:grid;place-items:center;background:linear-gradient(140deg,var(--brand),#4d6bff);color:#fff;font-weight:800;font-size:17px;box-shadow:0 6px 18px -6px rgba(77,107,255,.7)}
+.brand .name{font-weight:700;font-size:15px;letter-spacing:.2px}.brand .name span{color:var(--mut)}
+.card{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);border-radius:var(--radius);box-shadow:0 24px 60px -20px rgba(0,0,0,.7);overflow:hidden}
+.steps{display:flex;gap:6px;padding:16px 20px 0}
+.steps .seg{height:3px;flex:1;border-radius:99px;background:var(--line-2);overflow:hidden;position:relative}
+.steps .seg i{position:absolute;inset:0;width:0;background:linear-gradient(90deg,var(--brand),var(--brand-2));border-radius:99px;transition:width .45s cubic-bezier(.4,0,.2,1)}
+.steps .seg.done i,.steps .seg.active i{width:100%}
+.body{padding:22px 24px 24px}
+.eyebrow{font-size:11px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--brand-2);margin-bottom:9px}
+h1{font-size:21px;font-weight:700;margin:0 0 6px;letter-spacing:-.2px}
+.lead{color:var(--mut);font-size:13.5px;margin:0 0 20px}.lead b{color:var(--txt);font-weight:600}
+label{display:block;font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--mut-2);margin:0 0 8px}
+.field{position:relative;margin-bottom:4px}
+input{width:100%;background:var(--panel-2);border:1px solid var(--line-2);border-radius:11px;color:var(--txt);padding:13px 42px 13px 14px;font-size:14px;outline:none;transition:border-color .15s,box-shadow .15s;font-family:inherit}
+input::placeholder{color:#48546f}
+input:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(109,139,255,.16)}
+input.bad{border-color:var(--err);box-shadow:0 0 0 3px rgba(255,107,107,.14)}
+input.good{border-color:var(--ok);box-shadow:0 0 0 3px rgba(55,211,153,.14)}
+.reveal{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:0;color:var(--mut-2);cursor:pointer;padding:8px;border-radius:8px;display:grid;place-items:center}
+.reveal:hover{color:var(--txt);background:var(--line)}
+.hint{font-size:12px;color:var(--mut-2);margin:9px 2px 0;line-height:1.55}.hint a{color:var(--brand-2);text-decoration:none}.hint a:hover{text-decoration:underline}
+.callout{margin-top:14px;border:1px solid var(--line-2);border-radius:11px;padding:12px 14px;background:var(--panel-2);font-size:12.5px;color:var(--mut)}
+.callout.warn{border-color:#5a4413;background:rgba(245,181,68,.06)}
+.callout.warn .h{color:var(--warn);font-weight:600;margin-bottom:5px;display:flex;align-items:center;gap:7px}
+.callout ul{margin:6px 0 0;padding-left:18px}.callout li{margin:3px 0;color:var(--txt)}
+.actions{display:flex;gap:10px;margin-top:22px}
+.btn{flex:1;border:0;border-radius:11px;padding:13px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;transition:transform .08s,filter .15s,opacity .15s;display:flex;align-items:center;justify-content:center;gap:8px;text-decoration:none}
+.btn:active{transform:translateY(1px)}
+.btn.primary{background:linear-gradient(135deg,var(--brand),#4d6bff);color:#fff;box-shadow:0 8px 22px -10px rgba(77,107,255,.8)}
+.btn.primary:disabled{opacity:.45;cursor:not-allowed;box-shadow:none}
+.btn.ghost{flex:0 0 auto;padding:13px 16px;background:var(--panel-2);border:1px solid var(--line-2);color:var(--mut)}
+.btn.ghost:hover{color:var(--txt)}
+.btn.link{background:var(--panel-2);border:1px solid var(--line-2);color:var(--brand-2)}.btn.link:hover{border-color:var(--brand)}
+.status{display:flex;align-items:center;gap:9px;margin-top:16px;font-size:13px;color:var(--mut);min-height:20px}
+.status.ok{color:var(--ok)}.status.err{color:var(--err)}.status.busy{color:var(--brand-2)}
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}
+.status.busy .dot{animation:pulse 1.1s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:.35;transform:scale(.85)}50%{opacity:1;transform:scale(1)}}
+.spin{width:15px;height:15px;border:2px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:rot .7s linear infinite}
+.spin.big{width:44px;height:44px;border-width:4px;border-color:var(--line-2);border-top-color:var(--brand-2);margin:6px auto 0}
+@keyframes rot{to{transform:rotate(360deg)}}
+.foot{padding:14px 24px;border-top:1px solid var(--line);color:var(--mut-2);font-size:11px;background:var(--panel-2);display:flex;align-items:center;gap:8px;line-height:1.5}
+.scene{animation:sc .35s cubic-bezier(.2,.7,.3,1)}@keyframes sc{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.center{text-align:center}"""
 
 COMMON_JS = """
 var msg=document.getElementById('msg'),st=document.getElementById('st'),dot=document.getElementById('dot');
@@ -648,81 +833,84 @@ async function rpc(idx,method,args){var j=await jpost('/rpc',{api:idx,method:met
 """
 
 
-def license_page():
+def setup_page(title="Nighty <span>&middot; Setup</span>", first_lead=None):
+    """Single continuous onboarding wizard: License -> Account token -> Bot token
+    -> Authorize, collected client-side and provisioned in one shot (see
+    /provision). Replaces the old multi-page, stub-driven, restart-between-steps
+    flow. `title`/`first_lead` let add_account.sh retitle it for extra accounts."""
     return ("""<!DOCTYPE html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Nighty — Activate</title><style>%s</style></head><body><div class=card>
-<div class=logo><div class=mark>N</div><h1>Activate Nighty</h1></div>
-<div class=sub>Step 1/3 — enter your <b>Nighty license key</b>. Nighty needs it to start; without it the bot can sign in but <b>no commands will work</b>.</div>
-<label>License key</label><input id=key type=password placeholder="Paste your Nighty license key…" autocomplete=off spellcheck=false>
-<button class=primary id=go>Activate</button>
-<div class=status id=st><span class="dot" id=dot></span><span id=msg>Paste your license key to begin.</span></div>
-<div class=foot>This is the license key from your Nighty purchase (your Nighty dashboard or order email). It is saved locally to Nighty's own config only — the bridge does not store it.</div></div>
-<script>%s%s
-var key=document.getElementById('key'),go=document.getElementById('go');
-go.onclick=async function(){var k=(key.value||'').trim();if(!k){set('Enter your license key.','err');return;}go.disabled=true;set('Activating…');
- var j=await jpost('/license',{key:k},function(){set('Backend is still starting — waiting…','busy');});
- if(!j||!j.ok){set('Error: '+((j&&j.error)||'activation failed'),'err');go.disabled=false;return;}
- set('License saved. Restarting Nighty to apply it (about 90 seconds)…','ok');
- var tries=0;(function chk(){jtry('/state').then(function(s){if(s&&s.mode&&s.mode!=='license'){set('Ready - continuing to sign-in…','ok');location.href='/';return;}if(++tries>80){set('Taking longer than usual - reloading…','err');location.href='/';return;}setTimeout(chk,3000);});})();};
-key.addEventListener('keydown',function(e){if(e.key==='Enter'&&!go.disabled)go.click();});
-</script></body></html>""" % (CSS, "", COMMON_JS)).encode("utf-8")
-
-
-def login_page(main_idx):
-    return ("""<!DOCTYPE html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Nighty — Sign in</title><style>%s</style></head><body><div class=card>
-<div class=logo><div class=mark>N</div><h1>Nighty</h1></div>
-<div class=sub>Step 2/3 — sign in with your Discord account token.</div>
-<label>Discord token</label><input id=tok type=password placeholder="Paste your Discord account token…" autocomplete=off spellcheck=false>
-<button class=primary id=go disabled>Sign in</button>
-<div class=status id=st><span class="dot busy" id=dot></span><span id=msg>Connecting to backend…</span></div>
-<div class=foot>Token path: browser → this bridge → Nighty backend. Nothing is stored by the bridge.</div></div>
-<script>var MAIN=%d;%s
-var tok=document.getElementById('tok'),go=document.getElementById('go');
-rpc(MAIN,'getAvailableLoginOptions',[]).then(function(){set('Backend ready. Enter token and sign in.','ok');go.disabled=false;tok.focus();}).catch(function(e){set('Backend unavailable: '+e.message,'err');});
-go.onclick=async function(){var t=(tok.value||'').trim();if(!t){set('Enter a token.','err');return;}go.disabled=true;set('Signing in…');
- try{await rpc(MAIN,'saveTokenToConfig',[t]);}catch(e){}
- var tries=0;(function chk(){jtry('/state').then(function(s){if(s&&s.mode&&s.mode!=='login'){set('Signed in. Continuing…','ok');location.href='/';return;}if(++tries>12){set('Token was not accepted. Check it and try again.','err');go.disabled=false;return;}setTimeout(chk,1200);});})();};
-tok.addEventListener('keydown',function(e){if(e.key==='Enter'&&!go.disabled)go.click();});
-</script></body></html>""" % (CSS, main_idx, COMMON_JS)).encode("utf-8")
-
-
-def bottoken_page(main_idx, app_id=None):
-    return ("""<!DOCTYPE html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Nighty — Connect your bot</title><style>%s</style></head><body><div class=card>
-<div class=logo><div class=mark>N</div><h1>Connect your bot</h1></div>
-<div class=sub>Step 3/3 — paste your Discord <b>bot token</b>. It is verified, and checked for the required intents, <b>before</b> it is handed to Nighty.</div>
-<label>Bot token</label>
-<input id=tok type=password placeholder="Paste your bot token…" autocomplete=off spellcheck=false>
-<div class=intents id=intents>
-  <div class=ih>These intents are still OFF — turn them on, then re-check:</div>
-  <ul id=misslist></ul>
-  <a class=btnlink id=portal target=_blank rel=noopener href="#">Open the Bot settings ↗</a>
-  <div class=hint>Toggle them under <b>Privileged Gateway Intents</b>, Save Changes, then press <b>Validate &amp; connect</b> again.</div>
+<title>Nighty &mdash; Setup</title><style>%s</style></head><body>
+<div class=shell>
+  <div class=brand><div class=mark>N</div><div class=name>%s</div></div>
+  <div class=card>
+    <div class=steps id=steps><div class=seg><i></i></div><div class=seg><i></i></div><div class=seg><i></i></div><div class=seg><i></i></div></div>
+    <div class=body id=body></div>
+    <div class=foot><svg width=12 height=12 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2><path d="M12 2 4 6v6c0 5 3.5 8 8 10 4.5-2 8-5 8-10V6z"/></svg>Everything stays on this device &mdash; keys are written only to Nighty's local config.</div>
+  </div>
 </div>
-<button class=primary id=go>Validate &amp; connect</button>
-<div class=status id=st><span class="dot" id=dot></span><span id=msg>Paste your bot token to begin.</span></div>
-<div class=foot>Get a token at the <b>Developer Portal -> your app -> Bot -> Reset Token</b>, and enable the <b>Presence</b>, <b>Server Members</b> and <b>Message Content</b> intents on that same page. The token is sent only to your local Nighty backend — the bridge never stores it.</div></div>
-<script>var MAIN=%d;%s
-var tok=document.getElementById('tok'),go=document.getElementById('go');
-var intents=document.getElementById('intents'),misslist=document.getElementById('misslist'),portal=document.getElementById('portal');
-function showIntents(miss,url){misslist.innerHTML=(miss||[]).map(function(m){return '<li>'+m+'</li>';}).join('');if(url)portal.href=url;intents.style.display='block';}
-function hideIntents(){intents.style.display='none';}
-async function connect(t){set('Bot verified. Handing it to Nighty…','ok');
- var j=await jpost('/submit_token',{token:t},function(){set('Backend is still starting — waiting…','busy');});
- if(!j){set('Backend not ready — please try again in a moment.','err');go.disabled=false;return;}
- if(!j.ok){if(j.needs_intents){showIntents(j.missing,j.intents_url);}set('Error: '+(j.error||'submit failed'),'err');go.disabled=false;return;}
- set('Connected as '+j.bot_name+'. Starting Nighty…','ok');
- var tries=0;(function chk(){jtry('/state').then(function(s){if(s&&(s.mode==='main'||s.mode==='authorize')){set(s.mode==='authorize'?'Bot connected — authorization needed…':'Done! Loading panel…','ok');location.href='/';return;}if(++tries>70){set('Bot connected — continuing. Reload if this does not move on shortly.','err');go.disabled=false;return;}setTimeout(chk,2500);});})();}
-go.onclick=async function(){var t=(tok.value||'').trim();if(!t){set('Paste your bot token first.','err');return;}
- go.disabled=true;hideIntents();set('Checking the bot token with Discord…');
- var j=await jpost('/check_token',{token:t},function(){set('Backend is still starting — waiting…','busy');});
- if(!j){set('Backend not ready — please try again in a moment.','err');go.disabled=false;return;}
- if(!j.valid){set('Error: '+(j.error||'invalid token'),'err');go.disabled=false;return;}
- if(!j.intents_ok){set('Bot ‘'+j.bot_name+'’ found, but some intents are OFF.','err');showIntents(j.missing,j.intents_url);go.disabled=false;return;}
- await connect(t);};
-tok.addEventListener('keydown',function(e){if(e.key==='Enter'&&!go.disabled)go.click();});
-</script></body></html>""" % (CSS, main_idx, COMMON_JS)).encode("utf-8")
+<script>
+var LEAD=%s;
+var STEPS=[
+ {eye:'Step 1 of 4',title:'Activate Nighty',lead:LEAD||'Enter your <b>Nighty license key</b>. Nighty needs it to start &mdash; without it the bot signs in but no commands work.',label:'License key',ph:'Paste your Nighty license key',help:'From your Nighty purchase (dashboard or order email).',check:null},
+ {eye:'Step 2 of 4',title:'Sign in',lead:'Paste your <b>Discord account token</b>. This is the account Nighty runs as.',label:'Account token',ph:'Paste your Discord account token',help:'Token only, never your password. Sent straight to your local backend.',check:'/check_account'},
+ {eye:'Step 3 of 4',title:'Connect your bot',lead:'Paste your <b>bot token</b>. It is verified and checked for the required intents before it is used.',label:'Bot token',ph:'Paste your bot token',help:'Developer Portal &rarr; your app &rarr; Bot &rarr; Reset Token. Enable Presence, Server Members and Message Content.',check:'/check_bot'}
+];
+var i=0,vals=['','',''],reveal=false,authUrl='';
+function el(id){return document.getElementById(id);}
+async function jpost(p,b){try{var r=await fetch(p,{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});var t=await r.text();try{return JSON.parse(t);}catch(e){return null;}}catch(e){return null;}}
+async function jget(p){try{var r=await fetch(p,{cache:'no-store'});var t=await r.text();try{return JSON.parse(t);}catch(e){return null;}}catch(e){return null;}}
+function segs(){var s=el('steps').children;for(var k=0;k<4;k++)s[k].className='seg'+(k<i?' done':k===i?' active':'');}
+var EYE='<svg width=17 height=17 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx=12 cy=12 r=3/></svg>';
+function setmsg(t,c){var st=el('st');if(!st)return;st.className='status'+(c?' '+c:'');el('msg').innerHTML=t||'&nbsp;';}
+function busy(b,on,label){b.disabled=on;if(on){if(!b.dataset.t)b.dataset.t=b.innerHTML;b.innerHTML='<span class=spin></span>'+(label||'Working&hellip;');}else if(b.dataset.t){b.innerHTML=b.dataset.t;b.dataset.t='';}}
+function render(){
+ segs();
+ if(i<3){var s=STEPS[i];
+  el('body').innerHTML='<div class=scene><div class=eyebrow>'+s.eye+'</div><h1>'+s.title+'</h1><p class=lead>'+s.lead+'</p>'
+   +'<label>'+s.label+'</label><div class=field><input id=inp type='+(reveal?'text':'password')+' placeholder="'+s.ph+'" autocomplete=off spellcheck=false value="'+(vals[i]||'').replace(/"/g,'&quot;')+'"><button class=reveal id=rev title="Show / hide">'+EYE+'</button></div>'
+   +'<p class=hint>'+s.help+'</p><div id=extra></div>'
+   +'<div class=actions>'+(i>0?'<button class="btn ghost" id=back>Back</button>':'')+'<button class="btn primary" id=next>Continue</button></div>'
+   +'<div class=status id=st><span class=dot></span><span id=msg>&nbsp;</span></div></div>';
+  var inp=el('inp');inp.focus();
+  el('rev').onclick=function(){reveal=!reveal;vals[i]=inp.value;render();};
+  if(el('back'))el('back').onclick=function(){vals[i]=inp.value;i--;reveal=false;render();};
+  el('next').onclick=go;inp.addEventListener('keydown',function(e){if(e.key==='Enter')go();});
+ }else{
+  el('body').innerHTML='<div class=scene><div class=eyebrow>Step 4 of 4</div><h1>Authorize the bot</h1><p class=lead>One-time Discord step. Authorize the companion bot, then confirm &mdash; Nighty will not start until it is linked to your account.</p>'
+   +'<a class="btn link" id=auth href="'+(authUrl||'#')+'" target=_blank rel=noopener>Authorize on Discord &#8599;</a>'
+   +'<div class="callout warn"><div class=h><svg width=14 height=14 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>Authorization required</div>Nighty refuses to start if the bot is not linked. Authorize first, then confirm below.</div>'
+   +'<div class=actions><button class="btn ghost" id=back>Back</button><button class="btn primary" id=fin>I\\'ve authorized &mdash; finish</button></div>'
+   +'<div class=status id=st><span class=dot></span><span id=msg>&nbsp;</span></div></div>';
+  el('back').onclick=function(){i--;reveal=false;render();};
+  el('fin').onclick=finish;
+ }
+}
+async function go(){
+ var inp=el('inp'),v=(inp.value||'').trim();vals[i]=v;el('extra').innerHTML='';inp.classList.remove('bad','good');
+ if(!v){inp.classList.add('bad');setmsg('This field is required.','err');return;}
+ var s=STEPS[i],btn=el('next');
+ if(!s.check){inp.classList.add('good');i++;reveal=false;render();return;}
+ busy(btn,true,'Verifying&hellip;');setmsg('Checking with Discord&hellip;','busy');
+ var j=await jpost(s.check,{token:v});busy(btn,false);
+ if(!j){setmsg('Bridge not reachable &mdash; try again.','err');return;}
+ if(s.check==='/check_bot'){
+  if(!j.valid){inp.classList.add('bad');setmsg(j.error||'Invalid bot token.','err');return;}
+  if(!j.intents_ok){inp.classList.add('bad');setmsg('Some required intents are OFF.','err');
+   el('extra').innerHTML='<div class="callout warn"><div class=h>Enable these intents, then continue</div><ul>'+(j.missing||[]).map(function(m){return '<li>'+m+'</li>';}).join('')+'</ul><a class="btn link" style="margin-top:10px" target=_blank rel=noopener href="'+(j.intents_url||'#')+'">Open Bot settings &#8599;</a></div>';return;}
+  authUrl=j.authorize_url||'';
+ }else if(!j.ok){inp.classList.add('bad');setmsg(j.error||'Rejected.','err');return;}
+ inp.classList.add('good');setmsg('Looks good.','ok');setTimeout(function(){i++;reveal=false;render();},300);
+}
+async function finish(){
+ var btn=el('fin');busy(btn,true,'Provisioning&hellip;');setmsg('Writing configuration and starting Nighty&hellip;','busy');
+ var j=await jpost('/provision',{license:vals[0],account_token:vals[1],bot_token:vals[2]});
+ if(!j){busy(btn,false);setmsg('Bridge not reachable &mdash; try again.','err');return;}
+ if(!j.ok){busy(btn,false);if(j.step==='oauth'&&j.authorize_url){authUrl=j.authorize_url;el('auth').href=authUrl;}setmsg(j.error||'Could not finish setup.','err');return;}
+ setmsg('Configured. Starting Nighty (about 90 seconds)&hellip;','ok');
+ var n=0;(function chk(){jget('/state').then(function(s){if(s&&s.mode==='main'&&s.ready){setmsg('Done &mdash; loading panel&hellip;','ok');location.href='/';return;}if(s&&s.mode==='authorize'){setmsg('Bot connected but not authorized &mdash; re-check the authorization.','err');return;}if(++n>90){location.href='/';return;}setTimeout(chk,3000);});})();
+}
+render();
+</script></body></html>""" % (CSS, title, ("null" if first_lead is None else json.dumps(first_lead)))).encode("utf-8")
 
 
 def authorize_page(app_id=None):
@@ -734,27 +922,29 @@ def authorize_page(app_id=None):
              else "to a Discord server you are in")
     disabled = "" if url else "disabled"
     return ("""<!DOCTYPE html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Nighty — Authorize</title><style>%s</style></head><body><div class=card>
-<div class=logo><div class=mark>N</div><h1>Authorize the bot</h1></div>
-<div class=sub>Almost done. Nighty needs you to <b>authorize <span id=botn>%s</span></b> %s before it can start. This is a one-time Discord step — no password is handled here.</div>
-<ol>
-  <li>Click <b>Authorize on Discord</b> below and approve the prompt.</li>
-  <li>Come back here and press <b>I&#39;ve authorized - continue</b>.</li>
-</ol>
-<a class=btnlink id=auth href="%s" target=_blank rel=noopener>Authorize on Discord ↗</a>
-<button class=primary id=go %s>I&#39;ve authorized - continue</button>
-<div class=status id=st><span class="dot" id=dot></span><span id=msg>%s</span></div>
-<div class=foot>The link opens Discord&#39;s official authorization page for your own application (id <span id=appid>%s</span>). The bridge never sees your Discord password — you approve the bot directly on Discord.</div></div>
-<script>%s%s
+<title>Nighty &mdash; Authorize</title><style>%s</style></head><body>
+<div class=shell>
+  <div class=brand><div class=mark>N</div><div class=name>Nighty <span>&middot; Authorize</span></div></div>
+  <div class=card><div class=body>
+    <div class=eyebrow>Almost there</div><h1>Authorize the bot</h1>
+    <p class=lead>Nighty needs you to <b>authorize %s</b> %s before it can start. One-time Discord step &mdash; no password is handled here.</p>
+    <a class="btn link" id=auth href="%s" target=_blank rel=noopener>Authorize on Discord &#8599;</a>
+    <div class="callout warn"><div class=h><svg width=14 height=14 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>Authorization required</div>Approve the bot on Discord, then press confirm below. Nighty will not start until it is linked.</div>
+    <button class="btn primary" id=go style="width:100%%;margin-top:14px" %s>I&#39;ve authorized &mdash; continue</button>
+    <div class=status id=st><span class=dot id=dot></span><span id=msg>%s</span></div>
+  </div>
+  <div class=foot>Opens Discord&#39;s official authorization page for your application (id %s). The bridge never sees your Discord password.</div></div>
+</div>
+<script>%s
 var go=document.getElementById('go');
-go.onclick=async function(){go.disabled=true;set('Applying authorization - restarting Nighty (about 90 seconds)…','ok');
+go.onclick=async function(){go.disabled=true;set('Applying authorization &mdash; restarting Nighty (about 90 seconds)&hellip;','ok');
  await jpost('/recheck_auth',{});
- var tries=0;(function chk(){jtry('/state').then(function(s){if(s&&s.mode&&s.mode!=='authorize'&&s.mode!=='license'){set('Authorized - starting Nighty…','ok');location.href='/';return;}if(++tries>80){set('Still waiting - if you authorized, reload in a moment.','err');go.disabled=false;return;}setTimeout(chk,3000);});})();};
+ var tries=0;(function chk(){jtry('/state').then(function(s){if(s&&s.mode&&s.mode!=='authorize'&&s.mode!=='setup'){set('Authorized &mdash; starting Nighty&hellip;','ok');location.href='/';return;}if(++tries>80){set('Still waiting &mdash; if you authorized, reload in a moment.','err');go.disabled=false;return;}setTimeout(chk,3000);});})();};
 </script></body></html>""" % (
         CSS, bot_name, where, url, disabled,
         ("Authorize the bot, then continue." if url else
          "Could not build the authorization link - reload after the bot is ready."),
-        info.get("app_id") or app_id or "?", "", COMMON_JS)).encode("utf-8")
+        info.get("app_id") or app_id or "?", COMMON_JS)).encode("utf-8")
 
 
 def loading_page():
@@ -763,30 +953,30 @@ def loading_page():
     swaps itself for the real panel the moment the backend answers — so the user
     never sees a bare white error page during startup."""
     return ("""<!DOCTYPE html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Nighty — Loading</title><style>%s
-.lwrap{text-align:center}
-.spin{width:46px;height:46px;border-radius:50%%;border:4px solid var(--line);border-top-color:var(--ac2);animation:rot 1s linear infinite;margin:8px auto 0}
-@keyframes rot{to{transform:rotate(360deg)}}</style></head><body><div class=card>
-<div class=logo style="justify-content:center"><div class=mark>N</div><h1>Nighty</h1></div>
-<div class=lwrap><div class=spin></div>
-<div class=sub id=msg style="margin-top:20px">Waiting for backend to load…</div>
-<div class=foot style="border:0;text-align:center;margin-top:6px">First start can take a minute or two. This page continues on its own — no need to refresh.</div></div></div>
+<title>Nighty &mdash; Starting</title><style>%s</style></head><body>
+<div class=shell>
+  <div class=brand style="justify-content:center"><div class=mark>N</div><div class=name>Nighty <span>&middot; Starting</span></div></div>
+  <div class=card><div class="body center">
+    <div class="spin big"></div>
+    <p class=lead id=msg style="margin-top:18px">Waiting for the backend to load&hellip;</p>
+  </div>
+  <div class=foot style="justify-content:center">First start can take a minute or two &mdash; this page continues on its own.</div></div>
+</div>
 <script>
-// Poll the bridge state and advance automatically as soon as a real screen is
-// available: the panel is up (mode "main" + ready), OR Nighty needs the user on a
-// setup / authorization screen. We never get stuck waiting on a panel that will
-// not come up (e.g. the bot is unauthorized) — any non-loading state moves us on.
+// Advance as soon as a real screen exists: panel up (mode main + ready), or the
+// setup / authorization screen. Any non-loading state moves us on, so we never
+// hang on a panel that will not come up.
 var n=0, msg=document.getElementById('msg');
 function advance(s){
   if(!s||!s.mode) return false;
-  if(s.mode==='loading') return false;          // backend still initialising
-  if(s.mode==='main') return !!s.ready;          // panel must actually be up
-  return true;                                   // license/login/bottoken/authorize
+  if(s.mode==='loading') return false;
+  if(s.mode==='main') return !!s.ready;
+  return true;   // setup / authorize
 }
 function poll(){
   fetch('/state',{cache:'no-store'}).then(function(r){return r.json();}).then(function(s){
     if(advance(s)){ msg.textContent='Ready — loading…'; location.replace('/'); return; }
-    n++; msg.textContent='Waiting for backend to load… ('+(n*2)+'s)'; setTimeout(poll,2000);
+    n++; msg.textContent='Waiting for the backend to load… ('+(n*2)+'s)'; setTimeout(poll,2000);
   }).catch(function(){ n++; setTimeout(poll,2000); });
 }
 setTimeout(poll,1500);
@@ -800,12 +990,8 @@ def build_ui():
         # Stub/backend not reachable yet (early boot) — show the loading screen
         # instead of letting the exception surface as a blank error page.
         return loading_page()
-    if s["mode"] == "license":
-        return license_page()
-    if s["mode"] == "login":
-        return login_page(s["main_idx"])
-    if s["mode"] == "bottoken":
-        return bottoken_page(s["main_idx"], s.get("app_id"))
+    if s["mode"] == "setup":
+        return setup_page()
     if s["mode"] == "authorize":
         return authorize_page(s.get("app_id"))
     # mode == main but the native panel is not up yet — graceful loading screen.
@@ -917,6 +1103,17 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             api_path = self.path.startswith(("/state", "/events", "/ready"))
+            # Add-another-account mode (set by add_account.sh): re-serve the setup
+            # wizard, retitled, even though the box is already onboarded/locked, so
+            # a second account can be provisioned. Takes priority over the panel.
+            if not api_path and add_account_active():
+                if self.headers.get("Upgrade", "").lower() == "websocket":
+                    self.send_response(403); self.end_headers(); return
+                return self._send(setup_page(
+                    title="Nighty <span>&middot; Add account</span>",
+                    first_lead="Adding an <b>additional account</b> to Nighty. Enter its "
+                               "license key to begin — the account and bot are provisioned "
+                               "just like the first one."))
             # Authorization gate: if the box is onboarded but the bot is not
             # actually linked (and not locked), refuse to serve the native panel
             # and force the authorize screen — Nighty would otherwise serve a
@@ -962,21 +1159,11 @@ class H(BaseHTTPRequestHandler):
         try:
             ln = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(ln) if ln else b""
-            if self.path.startswith("/license"):
-                # Save the Nighty license key (step 0). Required before the bot
-                # connects, or its on_ready aborts at KeyError('motd').
-                try: key = json.loads(body or b"{}").get("key", "")
-                except Exception: key = ""
-                return self._send(json.dumps(save_license(key)), "application/json")
             if self.path.startswith("/recheck_auth"):
-                # The user confirms they authorized the bot ("I've authorized -
-                # continue"). Trust that explicit assertion: lock the setup as
-                # complete so the authorization screen never reappears (the only
-                # way back is uninstall.sh's reset), and restart the backend so
-                # Nighty reconnects with the now-authorized bot. This is the
-                # authoritative completion signal — we do not depend on the
-                # best-effort log-based link detection here, which can lag or
-                # misread once the bot is freshly authorized.
+                # Authorization backstop: the user confirms they authorized the
+                # bot. Lock the setup as complete so the authorize screen never
+                # reappears (only uninstall.sh's reset re-opens it), and restart
+                # the backend so Nighty reconnects with the now-authorized bot.
                 if _onboarded():
                     _set_lock()
                 try:
@@ -984,17 +1171,35 @@ class H(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 return self._send(json.dumps({"ok": True, "restarting": True}), "application/json")
-            if self.path.startswith("/check_token"):
-                # Validate the pasted bot token + its intents against Discord's
-                # API, without handing anything to Nighty yet.
+            if self.path.startswith("/check_account"):
+                # Validate a Discord account token against the API (resolves the
+                # username used as the login key). Nothing is written yet.
                 try: tok = json.loads(body or b"{}").get("token", "")
                 except Exception: tok = ""
-                return self._send(json.dumps(check_bot_token(tok)), "application/json")
-            if self.path.startswith("/submit_token"):
-                # Re-validate, then feed the bot token to Nighty (getAppTokenInput).
+                return self._send(json.dumps(check_account_token(tok)), "application/json")
+            if self.path.startswith("/check_bot"):
+                # Validate the bot token + its intents, and return the OAuth
+                # authorize URL for the final step. Nothing is handed to Nighty.
                 try: tok = json.loads(body or b"{}").get("token", "")
                 except Exception: tok = ""
-                return self._send(json.dumps(submit_bot_token(tok)), "application/json")
+                chk = check_bot_token(tok)
+                if chk.get("valid") and chk.get("app_id"):
+                    _, app = _discord_bot_get(tok, "/applications/@me")
+                    chk["authorize_url"] = bot_authorize_url(
+                        chk["app_id"], _app_integration_types(app if isinstance(app, dict) else {}))
+                return self._send(json.dumps(chk), "application/json")
+            if self.path.startswith("/provision"):
+                # Single-shot onboarding: validate license + tokens, enforce the
+                # OAuth gate, write auth.json + nighty.config directly, restart.
+                try: p = json.loads(body or b"{}")
+                except Exception: p = {}
+                res = provision(p.get("license", ""), p.get("account_token", ""),
+                                p.get("bot_token", ""))
+                # Leaving add-account mode on success restores the normal panel on
+                # the next load; a failed attempt keeps the wizard so it can retry.
+                if res.get("ok"):
+                    _clear_add_account()
+                return self._send(json.dumps(res), "application/json")
             if self.path.startswith("/rpc"):
                 req = urllib.request.Request(STUB + "/api/call", data=body,
                                              headers={"Content-Type": "application/json"}, method="POST")
