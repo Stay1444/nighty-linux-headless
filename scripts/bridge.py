@@ -348,8 +348,13 @@ def provision(license_key, account_token, bot_token, make_active=True, restart=T
     license_key = (license_key or "").strip()
     account_token = (account_token or "").strip()
     bot_token = (bot_token or "").strip()
-    if not (license_key and account_token and bot_token):
-        return {"ok": False, "error": "License, account token and bot token are all required."}
+    if not (account_token and bot_token):
+        return {"ok": False, "error": "Account token and bot token are required."}
+    # A Nighty install has ONE license, shared by every account. Require one only
+    # when none is saved yet; adding another account reuses the saved license (the
+    # wizard skips the license step), so an empty license_key is fine there.
+    if not license_key and not license_set():
+        return {"ok": False, "step": "license", "error": "A Nighty license key is required."}
     acct = check_account_token(account_token)
     if not acct.get("ok"):
         return {"ok": False, "step": "account", "error": acct.get("error")}
@@ -368,7 +373,9 @@ def provision(license_key, account_token, bot_token, make_active=True, restart=T
                 "authorize_url": bot_authorize_url(app_id, _app_integration_types(app)),
                 "error": "The bot is not authorized yet. Open 'Authorize on Discord', "
                          "approve it, then press finish."}
-    if not _write_auth_license(license_key):
+    # Only (over)write the license when a new one was entered; otherwise keep the
+    # one already on disk (add-account case).
+    if license_key and not _write_auth_license(license_key):
         return {"ok": False, "error": "Could not write the license file."}
     if not _write_login(acct["username"], account_token, app_id, bot_token, make_active=make_active):
         return {"ok": False, "error": "Could not write the account into nighty.config."}
@@ -833,11 +840,17 @@ async function rpc(idx,method,args){var j=await jpost('/rpc',{api:idx,method:met
 """
 
 
-def setup_page(title="Nighty <span>&middot; Setup</span>", first_lead=None):
+def setup_page(title="Nighty <span>&middot; Setup</span>", first_lead=None, skip_license=None):
     """Single continuous onboarding wizard: License -> Account token -> Bot token
     -> Authorize, collected client-side and provisioned in one shot (see
     /provision). Replaces the old multi-page, stub-driven, restart-between-steps
-    flow. `title`/`first_lead` let add_account.sh retitle it for extra accounts."""
+    flow. `title`/`first_lead` let add_account.sh retitle it for extra accounts.
+
+    A Nighty install has ONE license shared across all accounts, so when a working
+    license is already saved (skip_license, default: auto-detect via license_set)
+    the wizard shows the license step as already done and starts at the account
+    step; /provision then reuses the saved license."""
+    sl = license_set() if skip_license is None else bool(skip_license)
     return ("""<!DOCTYPE html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Nighty &mdash; Setup</title><style>%s</style></head><body>
 <div class=shell>
@@ -849,13 +862,13 @@ def setup_page(title="Nighty <span>&middot; Setup</span>", first_lead=None):
   </div>
 </div>
 <script>
-var LEAD=%s;
+var LEAD=%s;var SKIP_LICENSE=%s;var MINSTEP=SKIP_LICENSE?1:0;
 var STEPS=[
  {eye:'Step 1 of 4',title:'Activate Nighty',lead:LEAD||'Enter your <b>Nighty license key</b>. Nighty needs it to start &mdash; without it the bot signs in but no commands work.',label:'License key',ph:'Paste your Nighty license key',help:'From your Nighty purchase (dashboard or order email).',check:null},
  {eye:'Step 2 of 4',title:'Sign in',lead:'Paste your <b>Discord account token</b>. This is the account Nighty runs as.',label:'Account token',ph:'Paste your Discord account token',help:'Token only, never your password. Sent straight to your local backend.',check:'/check_account'},
  {eye:'Step 3 of 4',title:'Connect your bot',lead:'Paste your <b>bot token</b>. It is verified and checked for the required intents before it is used.',label:'Bot token',ph:'Paste your bot token',help:'Developer Portal &rarr; your app &rarr; Bot &rarr; Reset Token. Enable Presence, Server Members and Message Content.',check:'/check_bot'}
 ];
-var i=0,vals=['','',''],reveal=false,authUrl='';
+var i=MINSTEP,vals=['','',''],reveal=false,authUrl='';
 function el(id){return document.getElementById(id);}
 async function jpost(p,b){try{var r=await fetch(p,{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});var t=await r.text();try{return JSON.parse(t);}catch(e){return null;}}catch(e){return null;}}
 async function jget(p){try{var r=await fetch(p,{cache:'no-store'});var t=await r.text();try{return JSON.parse(t);}catch(e){return null;}}catch(e){return null;}}
@@ -869,7 +882,7 @@ function render(){
   el('body').innerHTML='<div class=scene><div class=eyebrow>'+s.eye+'</div><h1>'+s.title+'</h1><p class=lead>'+s.lead+'</p>'
    +'<label>'+s.label+'</label><div class=field><input id=inp type='+(reveal?'text':'password')+' placeholder="'+s.ph+'" autocomplete=off spellcheck=false value="'+(vals[i]||'').replace(/"/g,'&quot;')+'"><button class=reveal id=rev title="Show / hide">'+EYE+'</button></div>'
    +'<p class=hint>'+s.help+'</p><div id=extra></div>'
-   +'<div class=actions>'+(i>0?'<button class="btn ghost" id=back>Back</button>':'')+'<button class="btn primary" id=next>Continue</button></div>'
+   +'<div class=actions>'+(i>MINSTEP?'<button class="btn ghost" id=back>Back</button>':'')+'<button class="btn primary" id=next>Continue</button></div>'
    +'<div class=status id=st><span class=dot></span><span id=msg>&nbsp;</span></div></div>';
   var inp=el('inp');inp.focus();
   el('rev').onclick=function(){reveal=!reveal;vals[i]=inp.value;render();};
@@ -910,7 +923,8 @@ async function finish(){
  var n=0;(function chk(){jget('/state').then(function(s){if(s&&s.mode==='main'&&s.ready){setmsg('Done &mdash; loading panel&hellip;','ok');location.href='/';return;}if(s&&s.mode==='authorize'){setmsg('Bot connected but not authorized &mdash; re-check the authorization.','err');return;}if(++n>90){location.href='/';return;}setTimeout(chk,3000);});})();
 }
 render();
-</script></body></html>""" % (CSS, title, ("null" if first_lead is None else json.dumps(first_lead)))).encode("utf-8")
+</script></body></html>""" % (CSS, title, ("null" if first_lead is None else json.dumps(first_lead)),
+        ("true" if sl else "false"))).encode("utf-8")
 
 
 def authorize_page(app_id=None):
@@ -1111,9 +1125,8 @@ class H(BaseHTTPRequestHandler):
                     self.send_response(403); self.end_headers(); return
                 return self._send(setup_page(
                     title="Nighty <span>&middot; Add account</span>",
-                    first_lead="Adding an <b>additional account</b> to Nighty. Enter its "
-                               "license key to begin — the account and bot are provisioned "
-                               "just like the first one."))
+                    first_lead="Adding an <b>additional account</b> to Nighty. Your existing "
+                               "license is reused, so this starts at the account step."))
             # Authorization gate: if the box is onboarded but the bot is not
             # actually linked (and not locked), refuse to serve the native panel
             # and force the authorize screen — Nighty would otherwise serve a
