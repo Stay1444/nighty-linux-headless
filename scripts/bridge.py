@@ -333,44 +333,6 @@ def _write_login(username, account_token, app_id, bot_token, make_active=True):
     return True
 
 
-def _active_username():
-    """Username of the currently-active login in nighty.config, or None."""
-    appdata = find_appdata()
-    if not appdata:
-        return None
-    try:
-        d = json.load(open(os.path.join(appdata, "nighty.config"), encoding="utf-8"))
-        for u, info in (d.get("logins") or {}).items():
-            if isinstance(info, dict) and info.get("active"):
-                return u
-    except Exception:
-        pass
-    return None
-
-
-def _set_active_username(name):
-    """Make `name` the sole active login (used to roll back to the previously
-    working account when a freshly-added one turns out not to be authorized)."""
-    appdata = find_appdata()
-    if not appdata:
-        return False
-    cfg = os.path.join(appdata, "nighty.config")
-    try:
-        d = json.load(open(cfg, encoding="utf-8"))
-    except Exception:
-        return False
-    logins = d.get("logins")
-    if not isinstance(logins, dict) or name not in logins:
-        return False
-    for u, info in logins.items():
-        if isinstance(info, dict):
-            info["active"] = (u == name)
-    tmp = cfg + ".tmp"
-    json.dump(d, open(tmp, "w", encoding="utf-8"), indent=4, ensure_ascii=False)
-    os.replace(tmp, cfg)
-    return True
-
-
 def _restart_backend():
     """Bounce Nighty's backend; run.sh's loop relaunches it in ~3s."""
     try:
@@ -392,38 +354,76 @@ def _boot_gen():
         return 0
 
 
-def _wait_bot_link(prev_gen, timeout=180):
-    """Authoritative post-restart gate. Wait for the NEW backend (a boot beyond
-    prev_gen) and report whether its companion bot actually linked, reading
-    Nighty's own backend log rather than Discord's cached install counts (which
-    lag in both directions and cannot tell an authorized user-install from a
-    de-authorized one). Returns:
+def _bot_link_probe(prev_gen):
+    """One-shot (non-blocking) authoritative check of whether the companion bot
+    actually linked after a restart, reading Nighty's own backend log rather than
+    Discord's cached install counts (which lag in both directions and cannot tell
+    an authorized user-install from a de-authorized one). Scoped to the NEW boot
+    only — a "CTL server up" beyond prev_gen — so a stale success from the
+    previous account is never read. Returns:
+      'booting'      - the new backend has not produced a verdict yet.
       'connected'    - positive proof in the new boot: bot logged in AND commands
-                       synced (this is what a real, authorized bot always emits).
+                       synced (what a real, authorized bot always emits).
       'unauthorized' - on_ready failed (NotFound 10003 / Unknown Channel) or the
                        account gateway was rejected (HTTP 403).
-      'timeout'      - neither within `timeout`s (treat as not linked)."""
+    This is polled by get_state so the /provision HTTP request never has to block
+    on the ~60-90s boot (a long-held request was dropping on the LAN and showing
+    a false 'Bridge not reachable' even though provisioning had succeeded)."""
     p = _backend_log_path()
     if not p:
-        return "timeout"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            lines = open(p, encoding="utf-8", errors="replace").read().splitlines()
-        except Exception:
-            lines = []
-        idxs = [i for i, ln in enumerate(lines) if "CTL server up" in ln]
-        if len(idxs) > prev_gen:                 # the new backend has come up
-            seg = "\n".join(lines[idxs[-1]:])
-            neg = (("Ignoring exception in on_ready" in seg and "application_commands" in seg
-                    and ("10003" in seg or "Unknown Channel" in seg or "NotFound" in seg))
-                   or "server rejected WebSocket connection: HTTP 403" in seg)
-            if neg:
-                return "unauthorized"
-            if "Logged in as" in seg and "Commands synced" in seg:
-                return "connected"
-        time.sleep(3)
-    return "timeout"
+        return "booting"
+    try:
+        lines = open(p, encoding="utf-8", errors="replace").read().splitlines()
+    except Exception:
+        lines = []
+    idxs = [i for i, ln in enumerate(lines) if "CTL server up" in ln]
+    if len(idxs) <= prev_gen:                    # new backend not up yet
+        return "booting"
+    seg = "\n".join(lines[idxs[-1]:])
+    neg = (("Ignoring exception in on_ready" in seg and "application_commands" in seg
+            and ("10003" in seg or "Unknown Channel" in seg or "NotFound" in seg))
+           or "server rejected WebSocket connection: HTTP 403" in seg)
+    if neg:
+        return "unauthorized"
+    if "Logged in as" in seg and "Commands synced" in seg:
+        return "connected"
+    return "booting"
+
+
+def _verify_path():
+    ad = find_appdata()
+    return os.path.join(ad, ".provision_verify") if ad else None
+
+
+def _write_verify(gen):
+    """Mark that a provisioning just restarted the backend and its bot link must
+    be verified (against boot generation `gen`) by the next get_state polls."""
+    p = _verify_path()
+    if not p:
+        return
+    try:
+        json.dump({"gen": int(gen), "ts": time.time()}, open(p, "w", encoding="utf-8"))
+    except Exception:
+        pass
+
+
+def _read_verify():
+    p = _verify_path()
+    if not p or not os.path.exists(p):
+        return None
+    try:
+        return json.load(open(p, encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _clear_verify():
+    p = _verify_path()
+    try:
+        if p and os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
 
 
 def _add_account_path():
@@ -485,35 +485,20 @@ def provision(license_key, account_token, bot_token, make_active=True, restart=T
     # one already on disk (add-account case).
     if license_key and not _write_auth_license(license_key):
         return {"ok": False, "error": "Could not write the license file."}
-    # Remember the account that was active/working before we switch, so a failed
-    # add-account can roll straight back to it instead of leaving the box on a
-    # broken, unauthorized account.
-    prev_active = _active_username()
     prev_gen = _boot_gen()
     if not _write_login(acct["username"], account_token, app_id, bot_token, make_active=make_active):
         return {"ok": False, "error": "Could not write the account into nighty.config."}
     if restart:
         _restart_backend()
-        # Authoritative OAuth gate: Discord's install counts are cached and lag in
-        # BOTH directions (a fresh user-install reads 0; a just-de-authorized one
-        # still reads 1), so they cannot confirm authorization. Instead we boot the
-        # account and read whether Nighty's own companion bot actually linked. Only
-        # a positive link counts as success.
-        status = _wait_bot_link(prev_gen)
-        if status != "connected":
-            # Not linked -> the bot was never (or no longer) authorized on this
-            # account. Roll the active account back to the one that was working
-            # (if it is a different account) so the box keeps running, and tell the
-            # user to authorize and retry.
-            if prev_active and prev_active != acct["username"] and _set_active_username(prev_active):
-                _restart_backend()
-            return {"ok": False, "step": "oauth",
-                    "authorize_url": bot_authorize_url(app_id, _app_integration_types(app)),
-                    "error": ("Nighty could not link the bot to the account "
-                              "(it timed out). Open 'Authorize on Discord', approve it, "
-                              "then press finish.") if status == "timeout" else
-                             ("The bot is not authorized on the account. Open "
-                              "'Authorize on Discord', approve it, then press finish.")}
+        # Authoritative OAuth verification happens in get_state (polled by the
+        # client), NOT here: Discord's install counts are cached and lag in both
+        # directions, so the real signal is whether Nighty's own companion bot
+        # links after boot. We must NOT block this HTTP request on the ~60-90s
+        # boot — a long-held request was dropping on the LAN and surfacing a false
+        # "Bridge not reachable" even though provisioning had succeeded. So we
+        # arm a verify marker and return immediately; get_state then reports
+        # loading -> main (bot linked) or authorize (bot not authorized).
+        _write_verify(prev_gen)
     return {"ok": True, "username": acct["username"], "bot_name": chk.get("bot_name")}
 
 
@@ -875,6 +860,34 @@ def get_state():
     if not master_url:
         master_url = cur
     login_markers = ("loading.html", "discord_login.html", "auth.html")
+    # Post-provision verification window. /provision no longer blocks on the boot
+    # (that dropped on the LAN and showed a false "Bridge not reachable"); it arms
+    # a verify marker and returns at once, and the client polls here. We gate on
+    # Nighty's own backend log — the authoritative signal — not Discord's cached
+    # install counts. This also covers add-account on a locked box, which the
+    # plain "locked => main" shortcut below would otherwise wave straight through.
+    verify = _read_verify()
+    if verify is not None and (time.time() - verify.get("ts", 0)) > 300:
+        # Safety net: never let a stuck verification (e.g. a backend that never
+        # emits a verdict) brick the panel — give up after 5 min and let the
+        # normal main/authorize logic take over.
+        _clear_verify()
+        verify = None
+    if verify is not None:
+        probe = _bot_link_probe(verify.get("gen", 0))
+        if probe != "connected":
+            # 'booting' -> keep the spinner; 'unauthorized' -> bot was never / no
+            # longer authorized, show the authorize backstop. The marker stays so
+            # this holds until the user re-authorizes and finishes again (which
+            # re-arms it with a fresh boot generation).
+            return {"mode": "authorize" if probe == "unauthorized" else "loading",
+                    "cur": cur, "main_idx": main_idx, "total": ev.get("total", 0),
+                    "app_id": app_id, "events": ev.get("events", []),
+                    "locked": setup_locked(), "ready": bool(web_up())}
+        # Verified: the bot really linked. Leave verification (and add-account)
+        # mode and fall through to the normal main/lock path.
+        _clear_verify()
+        _clear_add_account()
     locked = setup_locked()
     if locked:
         # Lockdown: setup already completed once. Never re-enter any setup or
@@ -1049,12 +1062,12 @@ async function go(){
  inp.classList.add('good');setmsg('Looks good.','ok');setTimeout(function(){i++;reveal=false;render();},300);
 }
 async function finish(){
- var btn=el('fin');busy(btn,true,'Verifying&hellip;');setmsg('Starting Nighty and verifying the bot is authorized (up to ~3 min)&hellip;','busy');
+ var btn=el('fin');busy(btn,true,'Provisioning&hellip;');setmsg('Writing configuration and starting Nighty&hellip;','busy');
  var j=await jpost('/provision',{license:vals[0],account_token:vals[1],bot_token:vals[2]});
  if(!j){busy(btn,false);setmsg('Bridge not reachable &mdash; try again.','err');return;}
  if(!j.ok){busy(btn,false);if(j.step==='oauth'&&j.authorize_url){authUrl=j.authorize_url;el('auth').href=authUrl;}setmsg(j.error||'Could not finish setup.','err');return;}
- setmsg('Bot authorized &mdash; loading panel&hellip;','ok');
- var n=0;(function chk(){jget('/state').then(function(s){if(s&&s.mode==='main'&&s.ready){setmsg('Done &mdash; loading panel&hellip;','ok');location.href='/';return;}if(s&&s.mode==='authorize'){setmsg('Bot connected but not authorized &mdash; re-check the authorization.','err');return;}if(++n>90){location.href='/';return;}setTimeout(chk,3000);});})();
+ setmsg('Starting Nighty and verifying the bot link (up to ~3 min)&hellip;','busy');
+ var n=0;(function chk(){jget('/state').then(function(s){if(s&&s.mode==='main'&&s.ready){busy(btn,false);setmsg('Bot linked &mdash; loading panel&hellip;','ok');location.href='/';return;}if(s&&s.mode==='authorize'){busy(btn,false);setmsg('The bot is not authorized on the account &mdash; open Authorize on Discord, approve it, then finish again.','err');return;}if(++n>120){location.href='/';return;}setTimeout(chk,3000);});})();
 }
 render();
 </script></body></html>""" % (CSS, title, ("null" if first_lead is None else json.dumps(first_lead)),
@@ -1342,10 +1355,11 @@ class H(BaseHTTPRequestHandler):
                 except Exception: p = {}
                 res = provision(p.get("license", ""), p.get("account_token", ""),
                                 p.get("bot_token", ""))
-                # Leaving add-account mode on success restores the normal panel on
-                # the next load; a failed attempt keeps the wizard so it can retry.
-                if res.get("ok"):
-                    _clear_add_account()
+                # NB: add-account mode is left ON here on purpose. provision only
+                # writes config + restarts and returns at once; the bot link is not
+                # verified yet. get_state clears add-account (and the verify marker)
+                # only once the bot is confirmed linked, so a reload during the
+                # verify/authorize window still serves the wizard, not the panel.
                 return self._send(json.dumps(res), "application/json")
             if self.path.startswith("/rpc"):
                 req = urllib.request.Request(STUB + "/api/call", data=body,
