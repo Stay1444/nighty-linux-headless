@@ -27,6 +27,10 @@ set -a; [ -f "$HERE/.env" ] && . "$HERE/.env"; set +a
 : "${STUB_PORT:=8765}"
 : "${BRIDGE_PORT:=8088}"
 : "${ENFORCE_WEBUI:=1}"
+# Max seconds to wait for Nighty's stub control server to answer after
+# launching Wine before assuming the boot hung and retrying. Some Wine builds
+# can stall during first-prefix init well before Nighty's own code ever runs.
+: "${BOOT_TIMEOUT:=300}"
 mkdir -p "$NIGHTY_HOME"
 
 export WINEPREFIX
@@ -129,7 +133,12 @@ run_stack() {
   # Pre-launch config enforcement (notifications off, Web UI creds + web:true).
   python3 "$HERE/scripts/enforce_config.py" || true
 
-  # Virtual display.
+  # Virtual display. Xvfb refuses to auto-create /tmp/.X11-unix unless running
+  # as root, so on a non-root install (or any host where /tmp is freshly
+  # mounted/cleared) it silently fails to bind. create the socket dir
+  # ourselves rather than relying on Xvfb to do it.
+  mkdir -p /tmp/.X11-unix
+  chmod 1777 /tmp/.X11-unix 2>/dev/null || true
   pkill -f "Xvfb :$DISPLAY_NUM" 2>/dev/null || true
   sleep 1
   Xvfb ":$DISPLAY_NUM" -screen 0 1366x768x24 -nolisten tcp >/dev/null 2>&1 &
@@ -148,11 +157,38 @@ run_stack() {
     done ) &
   log "Web UI bridge up — open  http://<this-host-ip>:$BRIDGE_PORT/"
 
-  # Backend — relaunch forever (covers a UI-triggered restart/close).
+  # Backend — relaunch forever (covers a UI-triggered restart/close). A
+  # watchdog kills and retries if the stub control server never answers
+  # within BOOT_TIMEOUT — some Wine builds stall during first-prefix init
+  # with no error, well before Nighty's own code would ever hang or crash.
   ( while true; do
       python3 "$HERE/scripts/enforce_config.py" >/dev/null 2>&1 || true
       log "launching backend ($NIGHTY_STUB)…"
-      "$WINE_BIN" "$NIGHTY_STUB" >>"$NIGHTY_HOME/backend.log" 2>&1 || true
+      "$WINE_BIN" "$NIGHTY_STUB" >>"$NIGHTY_HOME/backend.log" 2>&1 &
+      BACKEND_PID=$!
+
+      (
+        waited=0
+        while [ "$waited" -lt "$BOOT_TIMEOUT" ]; do
+          kill -0 "$BACKEND_PID" 2>/dev/null || exit 0
+          # Bash builtin TCP probe (no curl/wget dependency): the stub is up
+          # once something accepts a connection on STUB_PORT.
+          if (exec 3<>"/dev/tcp/127.0.0.1/${STUB_PORT}") 2>/dev/null; then
+            exec 3<&- 3>&-
+            exit 0
+          fi
+          sleep 5
+          waited=$((waited + 5))
+        done
+        if kill -0 "$BACKEND_PID" 2>/dev/null; then
+          log "backend boot timed out after ${BOOT_TIMEOUT}s (stub never answered on :${STUB_PORT}) — killing and retrying."
+          kill -9 "$BACKEND_PID" 2>/dev/null || true
+        fi
+      ) &
+      WATCHDOG_PID=$!
+
+      wait "$BACKEND_PID" 2>/dev/null || true
+      kill "$WATCHDOG_PID" 2>/dev/null || true
       log "backend exited — relaunching in 3s (persistence)."
       ( "${WINE_BIN%64}server" -k 2>/dev/null || wineserver -k 2>/dev/null ) || true
       sleep 3
