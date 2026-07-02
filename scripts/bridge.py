@@ -466,9 +466,12 @@ def bot_authorize_url(app_id, integration_types=None):
         return None
     base = "https://discord.com/oauth2/authorize"
     types = integration_types or []
-    if 1 in types and 0 not in types:
+    # Nighty's companion bot runs on the ACCOUNT, so prefer user-install
+    # (integration_type=1) whenever the app supports it — even when it also allows
+    # guild install. The guild ("add to server") flow is only correct for apps
+    # that do NOT support user-install at all, so it stays as the fallback.
+    if 1 in types:
         return "%s?client_id=%s&integration_type=1&scope=applications.commands" % (base, app_id)
-    # Guild install (covers apps that support both, or only guild install).
     return "%s?client_id=%s&scope=bot+applications.commands&permissions=8" % (base, app_id)
 
 
@@ -493,7 +496,7 @@ def authorization_status():
         types = _app_integration_types(app)
         out["app_id"] = app.get("id")
         out["bot_name"] = app.get("name")
-        out["integration"] = "user" if (1 in types and 0 not in types) else "guild"
+        out["integration"] = "user" if 1 in types else "guild"
         out["authorize_url"] = bot_authorize_url(app.get("id"), types)
         _, gl = _discord_bot_get(tok, "/users/@me/guilds")
         guilds = len(gl) if isinstance(gl, list) else 0
@@ -816,7 +819,8 @@ input.good{border-color:var(--ok);box-shadow:0 0 0 3px rgba(55,211,153,.14)}
 .btn.link{background:var(--panel-2);border:1px solid var(--line-2);color:var(--brand-2)}.btn.link:hover{border-color:var(--brand)}
 .status{display:flex;align-items:center;gap:9px;margin-top:16px;font-size:13px;color:var(--mut);min-height:20px}
 .status.ok{color:var(--ok)}.status.err{color:var(--err)}.status.busy{color:var(--brand-2)}
-.dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:none;opacity:0;transition:opacity .12s}
+.status.ok .dot,.status.err .dot,.status.busy .dot{opacity:1}
 .status.busy .dot{animation:pulse 1.1s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:.35;transform:scale(.85)}50%{opacity:1;transform:scale(1)}}
 .spin{width:15px;height:15px;border:2px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:rot .7s linear infinite}
