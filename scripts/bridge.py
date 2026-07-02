@@ -254,14 +254,29 @@ def check_account_token(token):
 
 
 def _bot_authorized(token, app):
-    """Strict OAuth gate: has the bot actually been authorized/installed anywhere
-    yet (invited to at least one guild, or installed on at least one account)?
-    This is how we know the user completed the Discord authorize step before we
-    write the config and boot the backend."""
+    """Pre-flight OAuth check: has the companion bot been authorized/installed yet?
+
+    Guild-install apps expose a reliable, real-time signal — a non-empty guild
+    list. User-install apps do NOT: Discord's approximate_user_install_count is
+    cached and lags badly right after authorize (a freshly-approved app reads 0
+    for a long time, while one installed hours earlier reads 1), so a 0 here is
+    NOT proof the user skipped the step, and hard-blocking on it produced false
+    "bot is not authorized yet" errors even after a correct user-install.
+
+    So we only ever hard-block an app that is *guild-install only* and sits in no
+    guild. For user-installable apps we defer to the authoritative post-boot gate
+    instead of the stale count: after provisioning, bot_link_status() reads the
+    backend log and, when the bot really is unauthorized, on_ready fails
+    (NotFound 10003) — which drives the 'authorize' backstop mode. That gate is
+    real-time and never a false positive."""
     _, gl = _discord_bot_get(token, "/users/@me/guilds")
-    guilds = len(gl) if isinstance(gl, list) else 0
-    users = (app or {}).get("approximate_user_install_count") or 0
-    return bool(guilds) or bool(users)
+    if isinstance(gl, list) and gl:
+        return True
+    if (app or {}).get("approximate_user_install_count") or 0:
+        return True
+    # No guild, cached-0 install count: authorized iff the app supports user
+    # install (can't confirm here — let the post-boot auth-screen gate decide).
+    return 1 in _app_integration_types(app)
 
 
 def _write_auth_license(key):
@@ -784,7 +799,7 @@ display:flex;align-items:center;justify-content:center;padding:24px;line-height:
 background-image:radial-gradient(60rem 40rem at 88% -12%,rgba(109,139,255,.10),transparent 60%),radial-gradient(50rem 40rem at -10% 110%,rgba(55,211,153,.06),transparent 55%)}
 .shell{width:100%;max-width:440px}
 .brand{display:flex;align-items:center;gap:11px;margin:0 2px 18px}
-.brand .mark{width:34px;height:34px;border-radius:9px;display:grid;place-items:center;background:linear-gradient(140deg,var(--brand),#4d6bff);color:#fff;font-weight:800;font-size:17px;box-shadow:0 6px 18px -6px rgba(77,107,255,.7)}
+.brand .mark{width:38px;height:38px;flex:0 0 auto;background:url('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABACAMAAADS6oI8AAADAFBMVEVHcEwpc6k5ZahSo80DGWUxerhkyvA1frUzX7YwY7QwcLYraKovdrk0dLYxeLUxebguebYvfLYxa7NFq84/rMk0d7Uvd7cwe7YydrQ1gr02ebM3ir9FncxNt9Uze7g2frowebwuY7Qte8IvdbcxfLcwd7c3iL8pYbQtX7UxZrYwYrFHrs89ochHpM0ue7MufLwydLQxfrk2ebEzeLQyebosaLY7j8M1fbouYLA7kMMpXrg7brg1g7o1cbtCfcU6fKgydbU0c7guga8xf7w3hr4/psw9lMssX688i8Q1jLxIrdJEq9NDps1CqslFo9A7ocBDosczb7c0cLQ7j8MwgcMzcbIqXLQ5jcBDncg4jMAyZLsyX7g8o9BNsthAoMhIqtJIsNc9ocJCqcEtcqoze7QvY7YvfrMxarY5h71Rn9Q7a8ApYLU6lcs4h8EvgbY+lcU1iLs8ksA1jcFAlsZBi8pGrNGV6f5AhdQtY7IvbsA7h8EuW7FAo8NKq8hEqMA8kcQ6mbcyergwergzebgxeLczeroxdrcxeLo1h70yf7ouX7RApMcverUxd7kxdbkxfbouYrQyZbUygbwte7gzgLovY7Mzg7otXrI0crg1i70xe7kyebswdLVCocg5jMAuWrIucrktXLM4jbwucLU0hL4zabgufrgzhrk2iMA5jsA0a7owa7Izhbw0fLgvXLQxb7Qwe7Y3e8E1ibouX688lLwpYbQ2gboxb7k+lsYuZ7Uxbbg3dLs1Z7wtark0jcNApshFqc4vY7Y0bro7kb8sXqwxY7o1hLU5kcQ2j8QvYbhAnsgzerdCm8k7mMEtjrszZrgvfr43fr88k8M2d7o8iMMzdLc3gb9HrNA8pMMxaLMzc7E+k8dKr9Mtb7o/db06ar4yeb8+msMtVq44erMqW7hBmccsZbZAl8w4lrkversoeq0wbb81kbwqfLI4d78ydrQmebY2csIrdrAoWqs7j75AjMhHsddBm7tDm845ktJEoMtMkMA8n7pPltZBn9NYvd6trOCBAAAAgXRSTlMAAgMDAfwB/v78RAYgDtyGOxIm+/3Esej8/Akw/v/S/fzH/nv9HPrl/DBkyyL+vKDOSVlsL/roGJ79/VK0Wv7/Y/L9c+y+/PhX/OCrSFsr/myQnonh+458npb67//0Oets+v3n9NqTqsj8+bXC2P31pPz71vySAvhx6GH8UP7Gy/u1UXtGAAALfUlEQVRYw4SYeVxTVxbHbxIei1UQlU1BKKKtdd9Qpmrd6467Y+fjWJVR21Fbl/l02mk7kwXCEnYChCggS1gEQ0BJAMGFDwGJypZQkSooAkUFhGrr2s657yXwXhL09wfwCS/ne3/3nnvuuQ8h8+JYIMuNn6+bsnb3z1i796ydsvJfGzZaIpYlepc46Ps9mziI9ZZHWCw04vMpo3+D0D/phTFuo6dsePsXsSwQ68c/3X6cCqAh4yPOprVubmNIXaY0Guvy5T9XTn0XgYM2VO/d57Z7/ZAEDpq6clqIr6/vrVuXLoWQugQCim/IXre17yBYoLEnfv7hl//9sG/DEAQOWr/ncuc00E8h1SGnsQBxWv/X3t9WsiDI2wxsevky5PXrW2PGmPfAQutHPz/p4mVlZeXe+cXzaj3htF6+o8dsesvsIktkv/a5a/W9G7/vG7PHnFkWGvdN8rxf7/8KEjctfuNqDPDdN2XsWyxw0M5nq1686Hz16uW0P9YhSzOAf174y4P7lJKSIt+4Vp+m69br178PvXwQcLi39uSzFy9evWr/Y9Xl783EH1nUceFC8LlzSaTO9L15dr36nkp1D1SNBb//OjSAg3ZlTtJqqyrLy5s7V3UeNgM4KLYJjouLOwPCgIpvnrXfu9HcfGNAKtWJ94aaI5jgSZmZ2kQA1KuaVZ2dfzd5YLKNWBwREREXDIBzoKS+N6obADhP6hfQjfovNg6VqSz0dSAQMoFQ2dysWtW51egBNlogtqEDHiR1nFSdP+/jU45FEs4f61w9xBzBBAeSAgIg6lepDpsYmFdUVHQlIiIYpikYO7jf0ah6/Dgr8SmprKqqqjKflK1DACzRwliXNFBmZlkZRlR6mxhoSm8qEl+5EoHXAeKfefDBofbHjxMTKUJKGeh4ykLzADaatexoFAbkBErKMKKqysjAqC+zm5qKijo6sAfs4MMHO3aqSEAKpZs3b65JPITMr7LFoXyXqKiomCiKkJVVdtxoBJtbAACEIjEGYH04/Lt6DJCkGAiSNYlHzG41NlqtXnY0BgAx4EGSKJFklXkzDQxf2ncWBIz0SFiIC6AFaHUljFqSTyowXyKRZGpX2JvZolDlxtfKZDFYUWmNhWp1/vGqw8wR2IX2FBcXY8bZ9Jqajo6OC59ORiMfAyA/AysH8gNr0nAzecpBczSenrVBGFDYWFdXqM5YU7aVkQITnbrCdPHx8STg4sWaCpsrCxAatQbiq9V0gHacKQCqnG1ea2t4EFZhHQaoMyaNY4zArstDWFJCAUqBcLHms8kI2XtL8jPU6lisnBycI4HaWaZpBFVORvT0+MsMgMbYoxlfM0Yw36lV2FCCBS6UV1tavmw5CPOGjsDQcyB6YSH8wAAX7Xf4cyMDE/dreu72SBN4WFxFXV1Q4DKmgQmtPVJ+Aw2QXjwSH8/T1eqcNBy/sDCKlIt2uQkAMlCx+O7du0IyPk+qUCjqMg/QjFog+22trTKZsAEQOh0J6HPExzM6UOhSqJcBYGc8RbCFlsoh/l1+wgDAcwU9FzhoudZDKpNxG0A6nS5VefVq6jB4gI2Wx7jD8RZEiUxz7QxjByw0Y/HinkFAFwAUdgwDI2x5DcLoaB5XKAwNDRWIRB5CR5ztHLQ6KsiqLZdUOJkk7uELjbIIqpyHtKGnoYHPpaaIl6pQ2NJ3CySxiOBKSXdSoVAoEHVH84bhcbLQXJmsra1NgxUejhFe4eONNhoLOQo8hLT4vH5CMYdhYOz4PC9y+UEA4IEX0gDOLr9ln3xCASgPXuG2zCMHqly3gMvl87kGQF631Xh6PeGgJXlEHgPAE5AGMNuWBkhICA/30jgxa4UFmt5NcEkZAFZWi2jrZIHem8kjeAkJGCAgReQ66AcAeSo7KtP4Y3G5/v4JCRqNH6NWsNHsbi+uVIqf0AOIPAcWw+JsPsFjAJzbPtaPgINmyKJqE/QAqZTLBStzaQA8PD5hDJjFMMB20Hgl4PgDAIWDxeAOlNXWdvFpAEIzjPZ1Nlpy25kvoAMI3kKmxY/bcHwawFlhMEBOgKenlAmYPZghOMONATyvkcxEdqiF/EuIhtQRURI4sA05wEYj2zCAEl5If0IzZ9ABOOx37hUIhEKuXjCAGUwDs2oNgGgqPtE7eyACnEN+rcYAu4F/4yrf3xsQKqQBNH70NYJHpue6Y0DCAEA0czDRYQ2dREKBgAEYrBVQ5Z88CSsJCxsEEJoD9FICBurcrRgAL9FsRjVzEDkbARwNI4Qq5/fkSUAYBkgNDpwm0rcJNDNB7u5BMEsYkAcSxTB2IRvN4BF8ugi+w2CR2HLq4cOH/RgBNSwUG3g2gT48qFNRMVAsKQCOn+cVs4T+BJzVXUwAn7DV5wC0atsx4OEggOBClbNg1KlGF7UaTuqgIJlMhuMXMgzgOtJFcGmLDHIaYQA4nnLu7+7uFoQFBIRCfmPAHKaBce6NaXSAhkhjPIHztKsLVllAA/hNJBeBjYb1nwI9eRIKALyBhB5S5vCgH05zgQMxFg4SAITn5hL+R0YwaiXkqYenkNrgAn1BI6g8hCqnhPM1PjlZB5je3l5danLdIuZpNG5SID7SowYAHq3LmQcibNVtngHwbRqAT9YKKAHZ2Uo4+5TKeD2gZLDG6AU3Eui3ybYhNuZoUK577TZ7o8bQAs0UOdMB0QQfDxN2yPvZ2dlXQcp4HQnojVfMYhqYvyIz0wiw3PhEZ6ODhUYA7gT4lI0+KkpPpxDy1NsY4LzY0eg0XV3pkyjBdwZo3AABh+82k8YTNqu7c0BAgFBfDgDA24LYMHX/iKypoQhyeWrqbdB2oyqHdlX6ZEFzjhkYEEtod5p0bVCP+caA6YjNRv8W20RiRDo0tPJUOSZsMe43/ksBDC5iG1fMN+mcIRlv9+oBeJoAIJppaYHmf3CtogII6TBPZzFBfnvpKOOu1bvSp5IiSDAgJ8bOtO2EerMdA/BODaWyVbR/BEI7rn1WUSGOjGwiAUq5fHv8ZpOWr76+vvxpVlYK9P3kBYBZpwbydP8pXRgp4ARAX6ZbOhGN+pv1tWsRYjHpobQUGn/lt6bfricJTylCRr7WjAH8Bmg8DYDjl/TMRQusra3hQooJJCA7+9EEEwPoq+bmAQB4gHbS0tz11DFMD8CFAd8hFMNGWZ87FxeHCZF4lkpLsx/Z2pterU4AoL4cZgmuX5I1EvMXVA7aDIBkXTJZEiD+9j7FhB0V/0k6E1dQQHkoKmqa9+gjUwNo3UvX69fb21UqPFMp3ubfNkGeJuuVCpLL5cq+bz+9n0QCggsKCsTiDnAx09wrhk2DgPpj5bvMX4ChPx2IrgfceWSTRAEKSIAYtsQiMwbQRldXVwC0Y4DqqyFel+H2EeLfuZOaqoRsxIDSvhY9gGKIbcTvm39/sdJg4fyx9iHf07DRluT4O1jKYix5cemjFmsAYP2/DzP2SRgIo/ghxFxRFxkJQ6eWMpsY/oEORkdjoBIcWGRwgsX/oF3agTA5uLoWhyYlLUk7HIEwtgsxIeDiaALGQf0+GOXu7fder9/lXe7XdyOYBO3l922AkMtgavxMVl+rweChyKMo0MsfoOF8/oLVg4JHKAX35XIJAVG0eGtzFmcqoWF8T8bjzYYPmuAftfwhCmoB35/+bOY4MetjwDP464t6eX9AlzQKiWE8pWl6V+QDSyg2Vnv3hp7nYL2h/WgUx0ytVlXVdHW3luctzpLmuhBYEHAjAKJ4t7yezeIYDn3PHu0EVcdQEKFwBrA7g52kYIVh0BARVyg8xZMoNW0EMfZW4O2Y9v0j89vHfH+SOySd38RaX4iJLlz9skuphNrSpL7JmCR9Rrbf0jICf0jokuZtqdSAeYgTjjSZYjFs7TEBtuLqsnaCz3Uhbs6Sq8o+iPqPyR+Utet2S6nr6K/XFflcO82QnODz/wBUI3lTaOAH+AAAAABJRU5ErkJggg==') center/contain no-repeat;filter:drop-shadow(0 6px 14px rgba(77,107,255,.35))}
 .brand .name{font-weight:700;font-size:15px;letter-spacing:.2px}.brand .name span{color:var(--mut)}
 .card{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);border-radius:var(--radius);box-shadow:0 24px 60px -20px rgba(0,0,0,.7);overflow:hidden}
 .steps{display:flex;gap:6px;padding:16px 20px 0}
@@ -858,7 +873,7 @@ def setup_page(title="Nighty <span>&middot; Setup</span>", first_lead=None, skip
     return ("""<!DOCTYPE html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Nighty &mdash; Setup</title><style>%s</style></head><body>
 <div class=shell>
-  <div class=brand><div class=mark>N</div><div class=name>%s</div></div>
+  <div class=brand><div class=mark></div><div class=name>%s</div></div>
   <div class=card>
     <div class=steps id=steps><div class=seg><i></i></div><div class=seg><i></i></div><div class=seg><i></i></div><div class=seg><i></i></div></div>
     <div class=body id=body></div>
@@ -942,7 +957,7 @@ def authorize_page(app_id=None):
     return ("""<!DOCTYPE html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Nighty &mdash; Authorize</title><style>%s</style></head><body>
 <div class=shell>
-  <div class=brand><div class=mark>N</div><div class=name>Nighty <span>&middot; Authorize</span></div></div>
+  <div class=brand><div class=mark></div><div class=name>Nighty <span>&middot; Authorize</span></div></div>
   <div class=card><div class=body>
     <div class=eyebrow>Almost there</div><h1>Authorize the bot</h1>
     <p class=lead>Nighty needs you to <b>authorize %s</b> %s before it can start. One-time Discord step &mdash; no password is handled here.</p>
@@ -973,7 +988,7 @@ def loading_page():
     return ("""<!DOCTYPE html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Nighty &mdash; Starting</title><style>%s</style></head><body>
 <div class=shell>
-  <div class=brand style="justify-content:center"><div class=mark>N</div><div class=name>Nighty <span>&middot; Starting</span></div></div>
+  <div class=brand style="justify-content:center"><div class=mark></div><div class=name>Nighty <span>&middot; Starting</span></div></div>
   <div class=card><div class="body center">
     <div class="spin big"></div>
     <p class=lead id=msg style="margin-top:18px">Waiting for the backend to load&hellip;</p>
